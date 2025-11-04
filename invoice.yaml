@@ -1,0 +1,249 @@
+version: 1
+name: finance.invoices_without_gr.v18_duckdb
+description: >
+  List all supplier invoices posted within the given date range without a corresponding Goods Receipt (GR).
+  Uses NetPriceAmount from PO item (fallback to invoice_line_amount / qty).
+
+params:
+  start_date: "2025-10-01"
+  end_date: "2025-10-30"
+  vendor: ""
+  vendor_query: ""
+  batch_chunk_size: 30
+
+steps:
+
+  # 1) Invoice items
+  - op: fetch
+    name: inv_items
+    source: sap
+    service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SuplrInvcItemPurOrdRef
+    query_params:
+      $format: json
+      $select: SupplierInvoice,FiscalYear,SupplierInvoiceItem,PurchaseOrder,PurchaseOrderItem,SupplierInvoiceItemAmount,DocumentCurrency,QuantityInPurchaseOrderUnit
+      $orderby: "PurchaseOrder asc"
+    odata_filter: >
+      (PurchaseOrder ne '')
+
+  # 2) Invoice headers
+  - op: fetch
+    name: inv_headers
+    source: sap
+    service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice
+    query_params:
+      $format: json
+      $select: SupplierInvoice,FiscalYear,PostingDate,InvoicingParty,InvoiceGrossAmount,CompanyCode,DocumentCurrency,SupplierInvoiceStatus,CreationDate
+    odata_filter: >
+      {% set sd = start_date %} {% set ed = end_date %} {% set v = vendor %} {% set vq = vendor_query %}
+      (
+        {% if sd %} PostingDate ge datetime'{{ sd }}T00:00:00' {% endif %}
+        {% if ed %} and PostingDate le datetime'{{ ed }}T23:59:59' {% endif %}
+        {% if v %} and InvoicingParty eq '{{ v | upper }}' {% endif %}
+        {% if (not v) and vq %} and substringof('{{ vq | upper }}', InvoicingParty) {% endif %}
+      )
+
+  # 3) PO header (include audit fields)
+  - op: fetch
+    name: po_header
+    source: sap
+    service: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder
+    query_params:
+      $format: json
+      $select: PurchaseOrder,PurchasingGroup,Supplier,CompanyCode,CreationDate,CreatedByUser,LastChangeDateTime
+    odata_filter: >
+      (PurchaseOrder ne '')
+
+  # 4) PO item (include NetPriceAmount, Plant, InvoiceIsGoodsReceiptBased)
+  - op: fetch
+    name: po_items
+    source: sap
+    service: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem
+    query_params:
+      $format: json
+      $select: PurchaseOrder,PurchaseOrderItem,Material,PurchaseOrderItemText,OrderQuantity,NetPriceAmount,GoodsReceiptIsExpected,IsCompletelyDelivered,MaterialGroup,Plant,InvoiceIsGoodsReceiptBased
+    odata_filter: >
+      (PurchaseOrder ne '')
+
+  # 5) Business Partner
+  - op: fetch
+    name: bp_master
+    source: sap
+    service: API_BUSINESS_PARTNER/A_BusinessPartner
+    query_params:
+      $format: json
+      $select: BusinessPartner,BusinessPartnerFullName,OrganizationBPName1,OrganizationBPName2
+    odata_filter: >
+      (BusinessPartner ne '')
+
+  # === JOINS ===
+  - op: join
+    name: item_header
+    left: inv_items
+    right: inv_headers
+    left_on: [SupplierInvoice, FiscalYear]
+    right_on: [SupplierInvoice, FiscalYear]
+    type: inner
+
+  - op: join
+    name: inv_po_full
+    left: item_header
+    right: po_header
+    left_on: [PurchaseOrder]
+    right_on: [PurchaseOrder]
+    type: left
+
+  - op: join
+    name: inv_po_with_itemflags
+    left: inv_po_full
+    right: po_items
+    left_on: [PurchaseOrder, PurchaseOrderItem]
+    right_on: [PurchaseOrder, PurchaseOrderItem]
+    type: left
+
+  - op: join
+    name: inv_with_vendor
+    left: inv_po_with_itemflags
+    right: bp_master
+    left_on: [Supplier]
+    right_on: [BusinessPartner]
+    type: left
+
+  # === FLATTEN ===
+  - op: select
+    name: inv_flat
+    from: inv_with_vendor
+    columns:
+      - "SupplierInvoice AS invoice_no"
+      - "FiscalYear AS fiscal_year"
+      - "InvoicingParty AS vendor_number"
+      - "COALESCE(BusinessPartnerFullName, OrganizationBPName1, OrganizationBPName2, InvoicingParty) AS vendor_name"
+      - "PurchaseOrder AS po"
+      - "PurchaseOrderItem AS line_item_no"
+      - "COALESCE(PurchaseOrderItemText, Material) AS material_name"
+      - "Material AS material_code"
+      - "QuantityInPurchaseOrderUnit AS qty_invoiced"
+      - "OrderQuantity AS po_order_qty"
+      - "InvoiceGrossAmount AS invoice_amount"
+      - "SupplierInvoiceItemAmount AS invoice_line_amount"
+      - "DocumentCurrency AS currency"
+      - "NetPriceAmount AS net_price_raw"
+      - "PostingDate AS posting_date_raw"
+      - "CreationDate AS creation_date_raw"
+      - "PurchasingGroup AS purchasing_group"
+      - "CompanyCode AS company_code"
+      - "Plant AS plant_code"
+      - "InvoiceIsGoodsReceiptBased AS gr_based_iv"
+      - "GoodsReceiptIsExpected AS gr_expected"
+      - "IsCompletelyDelivered AS is_completely_delivered"
+      - "SupplierInvoiceStatus AS invoice_status_raw"
+      - "CreatedByUser AS po_created_by"
+      - "CreatedByUser AS po_changed_by"
+      - "LastChangeDateTime AS po_change_datetime"
+
+  # === DERIVE ===
+  - op: derive
+    name: inv_enriched
+    from: inv_flat
+    add:
+      - name: invoice_id
+        sql: "invoice_no || '/' || fiscal_year"
+      - name: amount_num
+        sql: "COALESCE(CAST(invoice_line_amount AS DOUBLE), CAST(invoice_amount AS DOUBLE), 0.0)"
+      - name: posting_date
+        sql: >
+          CASE
+            WHEN posting_date_raw LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(posting_date_raw,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            ELSE CAST(posting_date_raw AS DATE)
+          END
+      - name: po_date
+        sql: >
+          CASE
+            WHEN creation_date_raw LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(creation_date_raw,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            ELSE CAST(creation_date_raw AS DATE)
+          END
+      - name: qty
+        sql: "COALESCE(CAST(qty_invoiced AS DOUBLE), CAST(po_order_qty AS DOUBLE), 0.0)"
+      - name: net_price
+        sql: >
+          CASE
+            WHEN TRY_CAST(net_price_raw AS DOUBLE) IS NOT NULL THEN TRY_CAST(net_price_raw AS DOUBLE)
+            WHEN qty > 0 THEN amount_num / qty
+            ELSE NULL
+          END
+      - name: purchasing_group
+        sql: "COALESCE(purchasing_group, 'UNKNOWN')"
+      - name: company_name
+        sql: "COALESCE(vendor_name, company_code)"
+      - name: gr_based_iv_flag
+        sql: "CASE WHEN gr_based_iv = true THEN 'YES' WHEN gr_based_iv = false THEN 'NO' ELSE 'UNKNOWN' END"
+      - name: invoice_status
+        sql: >
+          CASE
+            WHEN invoice_status_raw = '1' THEN 'Parked'
+            WHEN invoice_status_raw = '2' THEN 'Approved'
+            WHEN invoice_status_raw = '3' THEN 'Reversed'
+            WHEN invoice_status_raw = '4' THEN 'Blocked for Payment'
+            WHEN invoice_status_raw = '5' THEN 'Posted'
+            WHEN invoice_status_raw = '6' THEN 'Cancelled'
+            ELSE 'Unknown'
+          END
+      - name: dateandtime
+        sql: "COALESCE(TRY_CAST(creation_date_raw AS TIMESTAMP), CAST(posting_date AS TIMESTAMP))"
+      - name: po_change_datetime
+        sql: "CASE WHEN po_change_datetime IS NOT NULL THEN TRY_CAST(po_change_datetime AS TIMESTAMP) ELSE NULL END"
+      - name: gr_status
+        sql: >
+          CASE
+            WHEN gr_expected = true AND (is_completely_delivered = false OR is_completely_delivered IS NULL) THEN 'PENDING GR'
+            WHEN gr_expected = true AND is_completely_delivered = true THEN 'GR OK'
+            WHEN gr_expected = false THEN 'NOT EXPECTED'
+            ELSE 'UNKNOWN'
+          END
+
+  # === FILTER ===
+  - op: filter
+    name: inv_without_gr
+    from: inv_enriched
+    where: >
+      posting_date IS NOT NULL
+      AND posting_date >= DATE('{{ start_date }}')
+      AND posting_date <= DATE('{{ end_date }}')
+      AND gr_status = 'PENDING GR'
+
+  # === FINAL OUTPUT ===
+  - op: select
+    name: final_output
+    from: inv_without_gr
+    columns:
+      - "company_code AS company_code"
+      - "company_name AS company_name"
+      - "plant_code AS plant_code"
+      - "purchasing_group AS Purchasing_group"
+      - "vendor_number AS vendor_number"
+      - "vendor_name AS vendor_name"
+      - "po AS po_no"
+      - "po_date AS po_date"
+      - "material_code AS material_code"
+      - "material_name AS material_name"
+      - "line_item_no AS line_item_no"
+      - "fiscal_year AS fiscal_year"
+      - "qty AS qty"
+      - "net_price AS net_price"
+      - "gr_based_iv_flag AS gr_based_iv"
+      - "gr_based_iv AS gr_based_iv_raw"
+      - "gr_status AS gr_status"
+      - "po_change_datetime AS po_change_datetime"
+      - "invoice_status AS invoice_status"
+      - "amount_num AS invoice_amount"
+      - "posting_date AS posting_date"
+      - "po_created_by AS po_created_by"
+      - "po_changed_by AS po_changed_by"
+      - "dateandtime AS dateandtime"
+
+project:
+  wrap: true
+  projection:
+    tables:
+      custom_invoice_report:
+        from: final_output
+        order_by: [posting_date desc, po_no asc, line_item_no asc]
