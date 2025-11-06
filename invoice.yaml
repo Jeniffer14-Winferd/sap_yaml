@@ -152,15 +152,19 @@ steps:
       - name: posting_date
         sql: >
           CASE
-            WHEN posting_date_raw LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(posting_date_raw,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            WHEN posting_date_raw LIKE '/Date(%'
+              THEN CAST((CAST(REGEXP_REPLACE(posting_date_raw,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP)::DATE
             ELSE CAST(posting_date_raw AS DATE)
           END
+
       - name: po_date
         sql: >
           CASE
-            WHEN creation_date_raw LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(creation_date_raw,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            WHEN creation_date_raw LIKE '/Date(%'
+              THEN CAST(CAST((CAST(REGEXP_REPLACE(creation_date_raw,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP) AS DATE)
             ELSE CAST(creation_date_raw AS DATE)
           END
+
       - name: qty
         sql: "COALESCE(CAST(qty_invoiced AS DOUBLE), CAST(po_order_qty AS DOUBLE), 0.0)"
       - name: net_price
@@ -206,8 +210,8 @@ steps:
     from: inv_enriched
     where: >
       posting_date IS NOT NULL
-      AND posting_date >= DATE('{{ start_date }}')
-      AND posting_date <= DATE('{{ end_date }}')
+      AND posting_date >= CAST('{{ start_date }}' AS DATE)
+      AND posting_date <= CAST('{{ end_date }}' AS DATE)
       AND gr_status = 'PENDING GR'
 
   # === FINAL OUTPUT ===
