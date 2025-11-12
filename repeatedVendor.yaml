@@ -150,8 +150,11 @@ steps:
     sql: "invoice_no || '/' || fiscal_year"
   - name: posting_date
     sql: >
-      CASE WHEN posting_date_raw LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(posting_date_raw,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
-           ELSE CAST(posting_date_raw AS DATE) END
+      CASE 
+        WHEN posting_date_raw LIKE '/Date(%'
+          THEN DATE(CAST((CAST(REGEXP_REPLACE(posting_date_raw,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+        ELSE CAST(posting_date_raw AS DATE) 
+      END
   - name: qty
     sql: "COALESCE(CAST(qty_invoiced AS DOUBLE), CAST(po_order_qty AS DOUBLE), 0.0)"
   - name: amount_num
