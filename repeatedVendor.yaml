@@ -1,0 +1,308 @@
+version: 1
+name: finance.vendors_repeat_ir_without_gr.v4_ranked_invoices.duckdb
+description: >
+  Identify vendors repeatedly posting IR (invoices) without prior GR (goods receipt)
+  within the requested date window. Aggregates vendor-level counts and lists offending invoices.
+  Includes company code, invoice status, responsible buyer, material name, posting date, and ranking.
+  Rank is also displayed in detailed invoice output.
+
+params:
+  start_date: "2025-09-01"
+  end_date: "2025-10-30"
+  vendor: ""
+  vendor_query: ""
+  min_repeat_threshold: 3
+  batch_chunk_size: 30
+
+steps:
+
+# === 1) Invoice items (IR lines)
+- op: fetch
+  name: inv_items
+  source: sap
+  service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SuplrInvcItemPurOrdRef
+  query_params:
+    $format: json
+    $select: SupplierInvoice,FiscalYear,SupplierInvoiceItem,PurchaseOrder,PurchaseOrderItem,SupplierInvoiceItemAmount,DocumentCurrency,QuantityInPurchaseOrderUnit
+    $orderby: "PurchaseOrder asc"
+  odata_filter: >
+    (PurchaseOrder ne '')
+
+# === 2) Invoice headers (vendor + posting date + status)
+- op: fetch
+  name: inv_headers
+  source: sap
+  service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice
+  query_params:
+    $format: json
+    $select: SupplierInvoice,FiscalYear,PostingDate,InvoicingParty,InvoiceGrossAmount,DocumentCurrency,CompanyCode,SupplierInvoiceStatus,CreationDate
+    $orderby: "PostingDate desc"
+  odata_filter: >
+    {% set sd = start_date %} {% set ed = end_date %} {% set v = vendor %} {% set vq = vendor_query %}
+    (
+      {% if sd %} PostingDate ge datetime'{{ sd }}T00:00:00' {% endif %}
+      {% if ed %} and PostingDate le datetime'{{ ed }}T23:59:59' {% endif %}
+      {% if v %} and InvoicingParty eq '{{ v | upper }}' {% endif %}
+      {% if (not v) and vq %} and substringof('{{ vq | upper }}', InvoicingParty) {% endif %}
+    )
+
+# === 3) Purchase Order header
+- op: fetch
+  name: po_header
+  source: sap
+  service: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder
+  query_params:
+    $format: json
+    $select: PurchaseOrder,PurchasingGroup,Supplier,CompanyCode,CreationDate
+    $orderby: "PurchaseOrder asc"
+  odata_filter: >
+    (PurchaseOrder ne '')
+
+# === 4) Purchase Order item (material, GR flags)
+- op: fetch
+  name: po_items
+  source: sap
+  service: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem
+  query_params:
+    $format: json
+    $select: PurchaseOrder,PurchaseOrderItem,PurchaseOrderItemText,GoodsReceiptIsExpected,IsCompletelyDelivered,Material,OrderQuantity
+    $orderby: "PurchaseOrder asc"
+  odata_filter: >
+    (PurchaseOrder ne '')
+
+# === 5) Business Partner (vendor master)
+- op: fetch
+  name: bp_master
+  source: sap
+  service: API_BUSINESS_PARTNER/A_BusinessPartner
+  query_params:
+    $format: json
+    $select: BusinessPartner,BusinessPartnerFullName,OrganizationBPName1,OrganizationBPName2
+    $orderby: "BusinessPartner asc"
+  odata_filter: >
+    (BusinessPartner ne '')
+
+# === JOINS ===
+- op: join
+  name: item_header
+  left: inv_items
+  right: inv_headers
+  left_on: [SupplierInvoice, FiscalYear]
+  right_on: [SupplierInvoice, FiscalYear]
+  type: inner
+
+- op: join
+  name: inv_po_header
+  left: item_header
+  right: po_header
+  left_on: [PurchaseOrder]
+  right_on: [PurchaseOrder]
+  type: left
+
+- op: join
+  name: inv_po_item
+  left: inv_po_header
+  right: po_items
+  left_on: [PurchaseOrder, PurchaseOrderItem]
+  right_on: [PurchaseOrder, PurchaseOrderItem]
+  type: left
+
+- op: join
+  name: inv_with_vendor
+  left: inv_po_item
+  right: bp_master
+  left_on: [InvoicingParty]
+  right_on: [BusinessPartner]
+  type: left
+
+# === FLATTEN ===
+- op: select
+  name: inv_flat
+  from: inv_with_vendor
+  columns:
+  - "SupplierInvoice AS invoice_no"
+  - "FiscalYear AS fiscal_year"
+  - "InvoicingParty AS vendor_number"
+  - "COALESCE(BusinessPartnerFullName, OrganizationBPName1, OrganizationBPName2, InvoicingParty) AS vendor_name"
+  - "PurchaseOrder AS po"
+  - "PurchaseOrderItem AS line_item_no"
+  - "Material AS material_code"
+  - "PurchaseOrderItemText AS material_name"
+  - "QuantityInPurchaseOrderUnit AS qty_invoiced"
+  - "OrderQuantity AS po_order_qty"
+  - "SupplierInvoiceItemAmount AS invoice_line_amount"
+  - "InvoiceGrossAmount AS invoice_amount"
+  - "DocumentCurrency AS currency"
+  - "PostingDate AS posting_date_raw"
+  - "CreationDate AS creation_date_raw"
+  - "PurchasingGroup AS purchasing_group"
+  - "CompanyCode AS company_code"
+  - "SupplierInvoiceStatus AS invoice_status_raw"
+  - "GoodsReceiptIsExpected AS gr_expected"
+  - "IsCompletelyDelivered AS is_completely_delivered"
+
+# === DERIVE ===
+- op: derive
+  name: inv_enriched
+  from: inv_flat
+  add:
+  - name: invoice_id
+    sql: "invoice_no || '/' || fiscal_year"
+  - name: posting_date
+    sql: >
+      CASE WHEN posting_date_raw LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(posting_date_raw,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+           ELSE CAST(posting_date_raw AS DATE) END
+  - name: qty
+    sql: "COALESCE(CAST(qty_invoiced AS DOUBLE), CAST(po_order_qty AS DOUBLE), 0.0)"
+  - name: amount_num
+    sql: "COALESCE(CAST(invoice_line_amount AS DOUBLE), CAST(invoice_amount AS DOUBLE), 0.0)"
+  - name: invoice_status
+    sql: >
+      CASE
+        WHEN invoice_status_raw = '1' THEN 'Parked'
+        WHEN invoice_status_raw = '2' THEN 'Approved'
+        WHEN invoice_status_raw = '3' THEN 'Reversed'
+        WHEN invoice_status_raw = '4' THEN 'Blocked for Payment'
+        WHEN invoice_status_raw = '5' THEN 'Posted'
+        WHEN invoice_status_raw = '6' THEN 'Cancelled'
+        ELSE 'Unknown'
+      END
+  - name: responsible_buyer
+    sql: "COALESCE(purchasing_group, 'UNKNOWN')"
+  - name: gr_status
+    sql: >
+      CASE
+        WHEN gr_expected = true AND (is_completely_delivered = false OR is_completely_delivered IS NULL) THEN 'PENDING GR'
+        WHEN gr_expected = true AND is_completely_delivered = true THEN 'GR OK'
+        WHEN gr_expected = false THEN 'NOT EXPECTED'
+        ELSE 'UNKNOWN'
+      END
+  - name: dateandtime
+    sql: "COALESCE(TRY_CAST(creation_date_raw AS TIMESTAMP), CAST(posting_date AS TIMESTAMP))"
+
+# === FILTER: date range
+- op: filter
+  name: inv_window
+  from: inv_enriched
+  where: >
+    posting_date IS NOT NULL
+    AND posting_date >= CAST('{{ start_date }}' AS DATE)
+    AND posting_date <= CAST('{{ end_date }}' AS DATE)
+
+# === Deduplicate invoices
+- op: derive
+  name: inv_with_rn
+  from: inv_window
+  add:
+  - name: rn
+    sql: "ROW_NUMBER() OVER (PARTITION BY invoice_id ORDER BY posting_date DESC)"
+
+- op: filter
+  name: inv_invoices_dedup
+  from: inv_with_rn
+  where: rn = 1
+
+# === Vendor-level aggregation
+- op: sql
+  name: vendor_aggregate_base
+  sql: |
+    SELECT
+      vendor_number,
+      vendor_name,
+      company_code,
+      COUNT(DISTINCT invoice_id) AS total_invoices,
+      SUM(CASE WHEN gr_status = 'PENDING GR' THEN 1 ELSE 0 END) AS invoices_pending_gr,
+      ROUND(SUM(CASE WHEN gr_status = 'PENDING GR' THEN 1.0 ELSE 0.0 END) / NULLIF(COUNT(DISTINCT invoice_id),0) * 100.0, 2) AS pct_pending_gr
+    FROM inv_invoices_dedup
+    GROUP BY vendor_number, vendor_name, company_code
+    ORDER BY invoices_pending_gr DESC
+
+# === Add ranking
+- op: sql
+  name: vendor_aggregate_ranked
+  sql: |
+    SELECT
+      vendor_number,
+      vendor_name,
+      company_code,
+      total_invoices,
+      invoices_pending_gr,
+      pct_pending_gr,
+      RANK() OVER (ORDER BY invoices_pending_gr DESC, pct_pending_gr DESC) AS rank,
+      CONCAT('invoices_pending_gr=', invoices_pending_gr, '; pct=', pct_pending_gr) AS rank_reason
+    FROM vendor_aggregate_base
+    ORDER BY rank, vendor_number
+
+# === Filter repeat offenders
+- op: sql
+  name: repeat_offenders
+  sql: |
+    SELECT *
+    FROM vendor_aggregate_ranked
+    WHERE invoices_pending_gr >= {{ min_repeat_threshold }}
+    ORDER BY rank, invoices_pending_gr DESC, pct_pending_gr DESC
+
+# === Offending invoice list
+- op: sql
+  name: offending_invoices
+  sql: |
+    SELECT
+      company_code,
+      responsible_buyer,
+      vendor_number,
+      vendor_name,
+      po,
+      line_item_no,
+      material_code,
+      material_name,
+      qty,
+      gr_status,
+      invoice_status,
+      amount_num AS invoice_amount,
+      posting_date,
+      dateandtime
+    FROM inv_invoices_dedup
+    WHERE gr_status = 'PENDING GR'
+    ORDER BY posting_date DESC, vendor_number
+
+# === Join ranks to offending invoices
+- op: join
+  name: offending_invoices_ranked
+  left: offending_invoices
+  right: vendor_aggregate_ranked
+  left_on: [vendor_number]
+  right_on: [vendor_number]
+  type: left
+
+# === FINAL OUTPUT
+- op: select
+  name: final_output
+  from: offending_invoices_ranked
+  columns:
+  - "rank AS vendor_rank"
+  - "vendor_number AS vendor_number"
+  - "vendor_name AS vendor_name"
+  - "company_code AS company_code"
+  - "responsible_buyer AS responsible_buyer"
+  - "po AS po_no"
+  - "line_item_no AS line_item_no"
+  - "material_code AS material_code"
+  - "material_name AS material_name"
+  - "qty AS qty"
+  - "invoice_amount AS invoice_amount"
+  - "invoice_status AS invoice_status"
+  - "gr_status AS gr_status"
+  - "posting_date AS posting_date"
+  - "dateandtime AS dateandtime"
+
+project:
+  wrap: true
+  projection:
+    tables:
+      ranked_vendor_summary:
+        from: vendor_aggregate_ranked
+      repeat_offenders:
+        from: repeat_offenders
+      ranked_offending_invoices:
+        from: final_output
+ 
