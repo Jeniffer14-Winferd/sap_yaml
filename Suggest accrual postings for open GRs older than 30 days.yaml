@@ -1,0 +1,245 @@
+version: 1
+name: finance.gr_accrual_candidates_overN.v1.duckdb
+description: >
+  Show all posted, open GRs (one row per GR document) for PO line items that have no PO-linked invoice (IR), where each GR is older than a threshold (default 30 days). Excludes cancelled GRs and reversal movement types (102, 122, 162, 222, 262). Includes vendor, PO/item, plant, GR date & qty, PO qty, net price, and GR value. Currency from PO header.
+
+params:
+  company_code: ""
+  vendor: ""
+  vendor_query: ""
+  po: ""
+  plant: ""
+  start_posting_date: ""
+  end_posting_date: ""
+  min_days_open: "30"
+  top: ""
+
+steps:
+
+# 1) PO header
+- op: fetch
+  name: po_header_raw
+  source: sap
+  service: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder
+  query_params:
+    $format: json
+    $select: PurchaseOrder,CompanyCode,Supplier,DocumentCurrency
+    $filter: "{{ \"Supplier eq '%s'\"|format(vendor)|strip if vendor else '' }}{{ ' and ' if vendor and po else '' }}{{ \"PurchaseOrder eq '%s'\"|format(po)|strip if po else '' }}{{ ' and ' if (vendor or po) and company_code else '' }}{{ \"CompanyCode eq '%s'\"|format(company_code)|strip if company_code else '' }}"
+
+# 2) PO items
+- op: fetch
+  name: po_items_raw
+  source: sap
+  service: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem
+  query_params:
+    $format: json
+    $select: PurchaseOrder,PurchaseOrderItem,Plant,Material,PurchaseOrderItemText,OrderQuantity,NetPriceAmount,NetPriceQuantity,DocumentCurrency
+    $filter: "{{ \"PurchaseOrder eq '%s'\"|format(po)|strip if po else '' }}{{ ' and ' if po and plant else '' }}{{ \"Plant eq '%s'\"|format(plant)|strip if plant else '' }}"
+
+# 3) Supplier name
+- op: fetch
+  name: bp_suppliers_raw
+  source: sap
+  service: API_BUSINESS_PARTNER/A_Supplier
+  query_params:
+    $format: json
+    $select: Supplier,SupplierName
+    $filter: "{{ \"Supplier eq '%s'\"|format(vendor)|strip if vendor else '' }}"
+
+# 4) Company Code name
+- op: fetch
+  name: company_codes_raw
+  source: sap
+  service: API_COMPANYCODE_SRV/A_CompanyCode
+  query_params:
+    $format: json
+    $select: CompanyCode,CompanyCodeName
+    $filter: "{{ \"CompanyCode eq '%s'\"|format(company_code)|strip if company_code else '' }}"
+
+# 5) GR header + items
+- op: fetch
+  name: gr_header_raw
+  source: sap
+  service: API_MATERIAL_DOCUMENT_SRV/A_MaterialDocumentHeader
+  query_params:
+    $format: json
+    $select: MaterialDocument,MaterialDocumentYear,PostingDate
+    $filter: "{{ \"PostingDate ge datetime'%sT00:00:00'\"|format(start_posting_date)|strip if start_posting_date else '' }}{{ ' and ' if start_posting_date and end_posting_date else '' }}{{ \"PostingDate le datetime'%sT23:59:59'\"|format(end_posting_date)|strip if end_posting_date else '' }}"
+
+- op: fetch
+  name: gr_items_raw
+  source: sap
+  service: API_MATERIAL_DOCUMENT_SRV/A_MaterialDocumentItem
+  query_params:
+    $format: json
+    $select: MaterialDocument,MaterialDocumentYear,GoodsMovementIsCancelled,GoodsMovementType,PurchaseOrder,PurchaseOrderItem,QuantityInBaseUnit,EntryUnit
+    $filter: "GoodsMovementIsCancelled eq false{{ ' and ' + (\"PurchaseOrder eq '%s'\"|format(po)|strip) if po else '' }}"
+
+- op: join
+  name: gr_joined
+  left: gr_items_raw
+  right: gr_header_raw
+  on: l.MaterialDocument = r.MaterialDocument and l.MaterialDocumentYear = r.MaterialDocumentYear
+  how: inner
+
+- op: filter
+  name: gr_no_reversals
+  from: gr_joined
+  where: "GoodsMovementType NOT IN ('102','122','162','222','262')"
+
+# 6) Attach PO header + items
+- op: join
+  name: gr_with_po
+  left: gr_no_reversals
+  right: po_header_raw
+  on: l.PurchaseOrder = r.PurchaseOrder
+  how: inner
+
+- op: join
+  name: gr_lines
+  left: gr_with_po
+  right: po_items_raw
+  on: l.PurchaseOrder = r.PurchaseOrder and l.PurchaseOrderItem = r.PurchaseOrderItem
+  how: left
+
+# 7) Derive GR fields including GR Value
+- op: derive
+  name: gr_lines_derived
+  from: gr_lines
+  add:
+  - { name: GR_Date, sql: "TRY_CAST(SUBSTR(PostingDate,1,10) AS DATE)" }
+  - { name: PO_Qty, sql: "TRY_CAST(OrderQuantity AS DOUBLE)" }
+  - { name: PO_NetPrice, sql: "CASE WHEN TRY_CAST(NetPriceQuantity AS DOUBLE) IS NULL OR TRY_CAST(NetPriceQuantity AS DOUBLE)=0 THEN TRY_CAST(NetPriceAmount AS DOUBLE) ELSE TRY_CAST(NetPriceAmount AS DOUBLE)/TRY_CAST(NetPriceQuantity AS DOUBLE) END" }
+  - { name: GR_Value, sql: "TRY_CAST(QuantityInBaseUnit AS DOUBLE) * CASE WHEN TRY_CAST(NetPriceQuantity AS DOUBLE) IS NULL OR TRY_CAST(NetPriceQuantity AS DOUBLE)=0 THEN TRY_CAST(NetPriceAmount AS DOUBLE) ELSE TRY_CAST(NetPriceAmount AS DOUBLE)/TRY_CAST(NetPriceQuantity AS DOUBLE) END" }
+  - { name: Days_Open, sql: "date_diff('day', GR_Date, CURRENT_DATE)" }
+  - { name: Older_Than_Threshold, sql: "CASE WHEN date_diff('day', GR_Date, CURRENT_DATE) >= CAST('{{ min_days_open }}' AS INTEGER) THEN 1 ELSE 0 END" }
+
+# 8) IR side
+- op: fetch
+  name: inv_header_raw
+  source: sap
+  service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice
+  query_params:
+    $format: json
+    $select: SupplierInvoice,FiscalYear,CompanyCode,DocumentDate
+    $filter: "{{ \"CompanyCode eq '%s'\"|format(company_code)|strip if company_code else '' }}"
+
+- op: fetch
+  name: inv_items_raw
+  source: sap
+  service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SuplrInvcItemPurOrdRef
+  query_params:
+    $format: json
+    $select: SupplierInvoice,FiscalYear,PurchaseOrder,PurchaseOrderItem
+
+- op: join
+  name: ir_joined
+  left: inv_items_raw
+  right: inv_header_raw
+  on: l.SupplierInvoice = r.SupplierInvoice and l.FiscalYear = r.FiscalYear
+  how: inner
+
+- op: groupby
+  name: ir_by_poline
+  from: ir_joined
+  by: [ PurchaseOrder, PurchaseOrderItem ]
+  aggs:
+  - { func: MAX, col: DocumentDate, as: Latest_IR_PostingDate }
+
+- op: derive
+  name: ir_by_poline_dates
+  from: ir_by_poline
+  add:
+  - { name: Latest_IR_Date, sql: "TRY_CAST(SUBSTR(Latest_IR_PostingDate,1,10) AS DATE)" }
+
+# 9) Keep ONLY GR rows with no IR and older than threshold
+- op: join
+  name: open_gr_candidates
+  left: gr_lines_derived
+  right: ir_by_poline_dates
+  on: l.PurchaseOrder = r.PurchaseOrder and l.PurchaseOrderItem = r.PurchaseOrderItem
+  how: left
+
+- op: filter
+  name: open_gr_rows
+  from: open_gr_candidates
+  where: "Latest_IR_Date IS NULL AND Older_Than_Threshold = 1"
+
+# 10) Enrich names
+- op: join
+  name: open_gr_named
+  left: open_gr_rows
+  right: bp_suppliers_raw
+  on: l.Supplier = r.Supplier
+  how: left
+
+- op: join
+  name: final_calc
+  left: open_gr_named
+  right: company_codes_raw
+  on: l.CompanyCode = r.CompanyCode
+  how: left
+
+# 11) Final select
+- op: select
+  name: accrual_gr_rows
+  from: final_calc
+  columns:
+  - "Supplier AS vendor_id"
+  - "COALESCE(SupplierName,'') AS vendor_name"
+  - "CompanyCode AS company_code"
+  - "COALESCE(CompanyCodeName,'') AS company_name"
+  - "PurchaseOrder AS po_number"
+  - "PurchaseOrderItem AS po_item"
+  - "Plant AS plant"
+  - "COALESCE(Material,'') AS material"
+  - "COALESCE(PurchaseOrderItemText,'') AS material_name"
+  - "DocumentCurrency AS currency"
+  - "MaterialDocument AS gr_number"
+  - "DATE(GR_Date) AS gr_posting_date"
+  - "QuantityInBaseUnit AS gr_qty_base"
+  - "COALESCE(EntryUnit,'') AS gr_base_uom"
+  - "PO_Qty AS po_qty"
+  - "PO_NetPrice AS po_netprice"
+  - "GR_Value AS gr_value"
+  - "CAST(Days_Open AS INTEGER) AS days_open"
+  - "'Posted' AS gr_status"
+  - "STRFTIME(GR_Date, '%Y-%m') AS gr_period"
+  - "'{{ min_days_open }}' AS threshold_days"
+  - "'{{ start_posting_date }}' AS period_start"
+  - "'{{ end_posting_date }}' AS period_end"
+
+project:
+  tables:
+    gr_accrual_candidates_grrows:
+      from: accrual_gr_rows
+      order_by:
+      - "po_number ASC"
+      - "po_item ASC"
+      - "gr_posting_date DESC"
+      - "gr_number DESC"
+      top: "{{ top if top else '' }}"
+      columns:
+      - "company_code        AS \"Company Code\""
+      - "company_name        AS \"Company Name\""
+      - "plant               AS \"Plant\""
+      - "vendor_id           AS \"Vendor\""
+      - "vendor_name         AS \"Vendor Name\""
+      - "po_number           AS \"PO Number\""
+      - "po_item             AS \"PO Item\""
+      - "material            AS \"Material\""
+      - "material_name       AS \"Material Name\""
+      - "currency            AS \"PO Currency\""
+      - "gr_number           AS \"GR Number\""
+      - "gr_posting_date     AS \"GR Posting Date\""
+      - "gr_qty_base         AS \"GR Qty (UoM)\""
+      - "gr_base_uom         AS \"Base UoM\""
+      - "po_qty              AS \"PO Quantity\""
+      - "po_netprice         AS \"Net Price\""
+      - "gr_value            AS \"GR Value\""
+      - "gr_status           AS \"GR Status\""
+      - "gr_period           AS \"GR Period\""
+      - "days_open           AS \"Days Open\""
+      - "threshold_days      AS \"Threshold (Days)\""
+      - "period_start        AS \"Period Start\""
+      - "period_end          AS \"Period End\""
