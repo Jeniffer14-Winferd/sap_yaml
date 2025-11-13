@@ -120,7 +120,11 @@ steps:
         sql: >
           CASE
             WHEN gr_posting_date_raw IS NULL THEN NULL
-            WHEN CAST(gr_posting_date_raw AS VARCHAR) LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(CAST(gr_posting_date_raw AS VARCHAR),'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            WHEN CAST(gr_posting_date_raw AS VARCHAR) LIKE '/Date(%' THEN
+              CAST(
+                CAST((CAST(REGEXP_REPLACE(CAST(gr_posting_date_raw AS VARCHAR),'[^0-9]','') AS BIGINT) / 1000) AS TIMESTAMP)
+                AS DATE
+              )
             ELSE TRY_CAST(gr_posting_date_raw AS DATE)
           END
       - name: po_item_key
@@ -210,14 +214,28 @@ steps:
           -- parse IR posting date similarly so we can compare
           CASE
             WHEN inv.PostingDate IS NULL THEN NULL
-            WHEN CAST(inv.PostingDate AS VARCHAR) LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(CAST(inv.PostingDate AS VARCHAR),'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            WHEN CAST(inv.PostingDate AS VARCHAR) LIKE '/Date(%' THEN
+              CAST(
+                CAST((CAST(REGEXP_REPLACE(CAST(inv.PostingDate AS VARCHAR),'[^0-9]','') AS BIGINT) / 1000) AS TIMESTAMP)
+                AS DATE
+              )
             ELSE TRY_CAST(inv.PostingDate AS DATE)
           END AS ir_posting_date_parsed,
           -- valid_gr_date is the gr date only when gr_posting_date <= ir_posting_date_parsed, else NULL
           CASE
             WHEN gr.gr_posting_date IS NULL THEN NULL
-            WHEN (CASE WHEN inv.PostingDate IS NULL THEN NULL WHEN CAST(inv.PostingDate AS VARCHAR) LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(CAST(inv.PostingDate AS VARCHAR),'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP)) ELSE TRY_CAST(inv.PostingDate AS DATE) END) IS NULL THEN NULL
-            WHEN gr.gr_posting_date <= (CASE WHEN inv.PostingDate IS NULL THEN NULL WHEN CAST(inv.PostingDate AS VARCHAR) LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(CAST(inv.PostingDate AS VARCHAR),'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP)) ELSE TRY_CAST(inv.PostingDate AS DATE) END) THEN gr.gr_posting_date
+            WHEN (CASE WHEN inv.PostingDate IS NULL THEN NULL WHEN CAST(inv.PostingDate AS VARCHAR) LIKE '/Date(%' THEN
+                CAST(
+                  CAST((CAST(REGEXP_REPLACE(CAST(inv.PostingDate AS VARCHAR),'[^0-9]','') AS BIGINT) / 1000) AS TIMESTAMP)
+                  AS DATE
+                )
+              ELSE TRY_CAST(inv.PostingDate AS DATE) END) IS NULL THEN NULL
+            WHEN gr.gr_posting_date <= (CASE WHEN inv.PostingDate IS NULL THEN NULL WHEN CAST(inv.PostingDate AS VARCHAR) LIKE '/Date(%' THEN
+                CAST(
+                  CAST((CAST(REGEXP_REPLACE(CAST(inv.PostingDate AS VARCHAR),'[^0-9]','') AS BIGINT) / 1000) AS TIMESTAMP)
+                  AS DATE
+                )
+              ELSE TRY_CAST(inv.PostingDate AS DATE) END) THEN gr.gr_posting_date
             ELSE NULL
           END AS valid_gr_date,
           ROW_NUMBER() OVER (
@@ -273,14 +291,22 @@ steps:
         sql: >
           CASE
             WHEN ir_posting_date_raw IS NULL THEN NULL
-            WHEN CAST(ir_posting_date_raw AS VARCHAR) LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(CAST(ir_posting_date_raw AS VARCHAR),'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            WHEN CAST(ir_posting_date_raw AS VARCHAR) LIKE '/Date(%' THEN
+              CAST(
+                CAST((CAST(REGEXP_REPLACE(CAST(ir_posting_date_raw AS VARCHAR),'[^0-9]','') AS BIGINT) / 1000) AS TIMESTAMP)
+                AS DATE
+              )
             ELSE TRY_CAST(ir_posting_date_raw AS DATE)
           END
       - name: gr_posting_date
         sql: >
           CASE
             WHEN gr_posting_date_raw IS NULL THEN NULL
-            WHEN CAST(gr_posting_date_raw AS VARCHAR) LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(CAST(gr_posting_date_raw AS VARCHAR),'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            WHEN CAST(gr_posting_date_raw AS VARCHAR) LIKE '/Date(%' THEN
+              CAST(
+                CAST((CAST(REGEXP_REPLACE(CAST(gr_posting_date_raw AS VARCHAR),'[^0-9]','') AS BIGINT) / 1000) AS TIMESTAMP)
+                AS DATE
+              )
             ELSE TRY_CAST(gr_posting_date_raw AS DATE)
           END
       - name: po_qty_num
@@ -306,7 +332,7 @@ steps:
       - name: fiscal_period
         sql: "CASE WHEN ir_posting_date IS NULL THEN NULL ELSE EXTRACT(MONTH FROM ir_posting_date) END"
       - name: dateandtime
-        sql: "COALESCE(TRY_CAST(po_change_datetime AS TIMESTAMP), TRY_CAST(ir_posting_date AS TIMESTAMP), TRY_CAST(gr_posting_date AS TIMESTAMP), TRY_CAST(DATE('{{ as_of_date }}') AS TIMESTAMP))"
+        sql: "COALESCE(TRY_CAST(po_change_datetime AS TIMESTAMP), TRY_CAST(ir_posting_date AS TIMESTAMP), TRY_CAST(gr_posting_date AS TIMESTAMP), TRY_CAST(CAST('{{ as_of_date }}' AS DATE) AS TIMESTAMP))"
 
   # 12) Filter according to rules:
   # require both dates present, exclude equal dates, only IR after GR (positive age)
@@ -319,8 +345,8 @@ steps:
       AND ir_posting_date <> gr_posting_date
       AND DATE_DIFF('day', gr_posting_date, ir_posting_date) > 0
       {% if vendor %} AND vendor_number = '{{ vendor | upper }}' {% endif %}
-      {% if start_date %} AND (gr_posting_date >= DATE('{{ start_date }}') OR ir_posting_date >= DATE('{{ start_date }}')) {% endif %}
-      {% if end_date %} AND (gr_posting_date <= DATE('{{ end_date }}') OR ir_posting_date <= DATE('{{ end_date }}')) {% endif %}
+      {% if start_date %} AND (gr_posting_date >= CAST('{{ start_date }}' AS DATE) OR ir_posting_date >= CAST('{{ start_date }}' AS DATE)) {% endif %}
+      {% if end_date %} AND (gr_posting_date <= CAST('{{ end_date }}' AS DATE) OR ir_posting_date <= CAST('{{ end_date }}' AS DATE)) {% endif %}
 
   # 13) Aggregate to the requested compact output fields in the exact order the user requested
   - op: sql
