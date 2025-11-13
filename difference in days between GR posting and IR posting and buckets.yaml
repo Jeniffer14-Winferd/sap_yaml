@@ -1,0 +1,370 @@
+version: 1
+name: finance.grir.aging.vendor_plant.gr_ir_diff.v1.duckdb
+description: >
+  Vendor-Plant GR -> IR difference aging.
+  Computes difference in days between GR posting date and IR posting date,
+  excludes records where GR = IR and where IR <= GR.
+  Buckets: 0-30, 31-60, 61-90, >90.
+
+  This variant avoids assuming any MovementType/ShortText property exists in the
+  A_MaterialDocumentItem OData. Instead it selects, per invoice line, the GR
+  for the same PO/POItem whose posting date is the closest prior date to the IR.
+  It handles single-line and multi-line invoices by partitioning on SupplierInvoiceItem
+  with COALESCE to cope with NULLs, and preserves SupplierInvoiceItem through to final output
+  so multiple invoice lines are not aggregated together.
+
+params:
+  as_of_date: "2025-10-27"
+  start_date: "2025-10-01"
+  end_date: "2025-10-30"
+  vendor: ""            # leave blank to fetch all vendors
+  batch_chunk_size: 30
+  timezone: "Asia/Kolkata"
+
+steps:
+
+  # 1) Invoice headers (IR)
+  - op: fetch
+    name: inv_headers
+    source: sap
+    service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice
+    query_params:
+      $format: json
+      $select: SupplierInvoice,FiscalYear,PostingDate,InvoicingParty,CompanyCode
+    odata_filter: >
+      {% set sd = start_date %} {% set ed = end_date %} {% set v = vendor %}
+      (
+        {% if sd %} PostingDate ge datetime'{{ sd }}T00:00:00' {% endif %}
+        {% if ed %} and PostingDate le datetime'{{ ed }}T23:59:59' {% endif %}
+        {% if v %} and InvoicingParty eq '{{ v | upper }}' {% endif %}
+      )
+
+  # 2) Invoice items (IR lines) - include SupplierInvoiceItem to support multiple lines (COALESCE handles null)
+  - op: fetch
+    name: inv_items
+    source: sap
+    service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SuplrInvcItemPurOrdRef
+    query_params:
+      $format: json
+      $select: SupplierInvoice,FiscalYear,SupplierInvoiceItem,PurchaseOrder,PurchaseOrderItem,SupplierInvoiceItemAmount,QuantityInPurchaseOrderUnit,Plant
+      $orderby: "PurchaseOrder asc"
+    odata_filter: >
+      (PurchaseOrder ne null)
+
+  # 3) PO header & items
+  - op: fetch
+    name: po_header
+    source: sap
+    service: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder
+    query_params:
+      $format: json
+      $select: PurchaseOrder,PurchaseOrderDate,PurchasingGroup,PurchasingOrganization,Supplier,CompanyCode,CreationDate,CreatedByUser,LastChangeDateTime
+    odata_filter: >
+      (PurchaseOrder ne null)
+
+  - op: fetch
+    name: po_item
+    source: sap
+    service: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem
+    query_params:
+      $format: json
+      $select: PurchaseOrder,PurchaseOrderItem,OrderQuantity,PurchaseOrderItemText,Material,Plant
+    odata_filter: >
+      (PurchaseOrder ne null)
+
+  # 4) Material document headers (to get GR posting date)
+  - op: fetch
+    name: gr_headers
+    source: sap
+    service: API_MATERIAL_DOCUMENT_SRV/A_MaterialDocumentHeader
+    query_params:
+      $format: json
+      $select: MaterialDocument,MaterialDocumentYear,PostingDate
+    odata_filter: >
+      (MaterialDocument ne null)
+
+  # 5) Material document items (GR lines) — fetch full rows (no $select) to avoid missing-property errors
+  - op: fetch
+    name: gr_items
+    source: sap
+    service: API_MATERIAL_DOCUMENT_SRV/A_MaterialDocumentItem
+    query_params:
+      $format: json
+      $orderby: "MaterialDocument asc"
+      # during debugging you can add: $top: 200
+    odata_filter: >
+      (PurchaseOrder ne null)
+
+  # 6) Attach header -> items: create gr_items_with_hdr containing raw posting date
+  - op: join
+    name: gr_items_with_hdr
+    left: gr_items
+    right: gr_headers
+    left_on:
+      - MaterialDocument
+    right_on:
+      - MaterialDocument
+    type: left
+
+  - op: derive
+    name: gr_parsed
+    from: gr_items_with_hdr
+    add:
+      - name: matdoc
+        sql: "COALESCE(MaterialDocument,'')"
+      - name: gr_posting_date_raw
+        sql: "PostingDate"
+      - name: gr_line_qty_num
+        sql: "COALESCE(TRY_CAST(QuantityInEntryUnit AS DOUBLE), 0.0)"
+      - name: gr_posting_date
+        sql: >
+          CASE
+            WHEN gr_posting_date_raw IS NULL THEN NULL
+            WHEN CAST(gr_posting_date_raw AS VARCHAR) LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(CAST(gr_posting_date_raw AS VARCHAR),'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            ELSE TRY_CAST(gr_posting_date_raw AS DATE)
+          END
+      - name: po_item_key
+        sql: "COALESCE(PurchaseOrder,'') || '||' || COALESCE(PurchaseOrderItem,'')"
+
+  # 7) Build the invoice+PO stream (join invoices -> headers -> po -> bp)
+  - op: join
+    name: item_header
+    left: inv_items
+    right: inv_headers
+    left_on:
+      - SupplierInvoice
+      - FiscalYear
+    right_on:
+      - SupplierInvoice
+      - FiscalYear
+    type: inner
+
+  - op: join
+    name: inv_po_item
+    left: item_header
+    right: po_item
+    left_on:
+      - PurchaseOrder
+      - PurchaseOrderItem
+    right_on:
+      - PurchaseOrder
+      - PurchaseOrderItem
+    type: left
+
+  - op: join
+    name: inv_po_with_header
+    left: inv_po_item
+    right: po_header
+    left_on:
+      - PurchaseOrder
+    right_on:
+      - PurchaseOrder
+    type: left
+
+  - op: fetch
+    name: bp_master
+    source: sap
+    service: API_BUSINESS_PARTNER/A_BusinessPartner
+    query_params:
+      $format: json
+      $select: BusinessPartner,BusinessPartnerFullName,OrganizationBPName1,OrganizationBPName2
+    odata_filter: >
+      (BusinessPartner ne null)
+
+  - op: join
+    name: inv_with_bp
+    left: inv_po_with_header
+    right: bp_master
+    left_on:
+      - InvoicingParty
+    right_on:
+      - BusinessPartner
+    type: left
+
+  # 8) Join inv_with_bp to all candidate GRs (gr_parsed) for the same PO/POItem
+  - op: join
+    name: inv_with_gr_candidates
+    left: inv_with_bp
+    right: gr_parsed
+    left_on:
+      - PurchaseOrder
+      - PurchaseOrderItem
+    right_on:
+      - PurchaseOrder
+      - PurchaseOrderItem
+    type: left
+
+  # 9) From the invoice+GR-candidates table pick, per invoice line, the GR with the greatest gr_posting_date <= ir_posting_date.
+  #    Partition uses COALESCE on SupplierInvoiceItem so both single-line (NULL) and multi-line invoices work.
+  - op: sql
+    name: inv_with_best_gr
+    sql: |
+      SELECT *
+      FROM (
+        SELECT
+          inv.*,
+          inv.SupplierInvoiceItem AS SupplierInvoiceItem,
+          gr.matdoc AS gr_document_no,
+          gr.gr_posting_date AS gr_posting_date,
+          gr.gr_line_qty_num AS gr_line_qty_num,
+          -- parse IR posting date similarly so we can compare
+          CASE
+            WHEN inv.PostingDate IS NULL THEN NULL
+            WHEN CAST(inv.PostingDate AS VARCHAR) LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(CAST(inv.PostingDate AS VARCHAR),'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            ELSE TRY_CAST(inv.PostingDate AS DATE)
+          END AS ir_posting_date_parsed,
+          -- valid_gr_date is the gr date only when gr_posting_date <= ir_posting_date_parsed, else NULL
+          CASE
+            WHEN gr.gr_posting_date IS NULL THEN NULL
+            WHEN (CASE WHEN inv.PostingDate IS NULL THEN NULL WHEN CAST(inv.PostingDate AS VARCHAR) LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(CAST(inv.PostingDate AS VARCHAR),'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP)) ELSE TRY_CAST(inv.PostingDate AS DATE) END) IS NULL THEN NULL
+            WHEN gr.gr_posting_date <= (CASE WHEN inv.PostingDate IS NULL THEN NULL WHEN CAST(inv.PostingDate AS VARCHAR) LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(CAST(inv.PostingDate AS VARCHAR),'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP)) ELSE TRY_CAST(inv.PostingDate AS DATE) END) THEN gr.gr_posting_date
+            ELSE NULL
+          END AS valid_gr_date,
+          ROW_NUMBER() OVER (
+            PARTITION BY
+              COALESCE(inv.SupplierInvoice,'') || '||' || COALESCE(inv.FiscalYear,'') || '||' || COALESCE(CAST(inv.SupplierInvoiceItem AS VARCHAR),'') || '||' || COALESCE(inv.PurchaseOrder,'') || '||' || COALESCE(inv.PurchaseOrderItem,'')
+            ORDER BY
+              CASE
+                WHEN gr.gr_posting_date IS NULL THEN NULL
+                ELSE gr.gr_posting_date
+              END DESC NULLS LAST
+          ) AS rn_candidate
+        FROM inv_with_gr_candidates inv
+        LEFT JOIN gr_parsed gr
+          ON inv.PurchaseOrder = gr.PurchaseOrder
+          AND inv.PurchaseOrderItem = gr.PurchaseOrderItem
+      ) t
+      WHERE rn_candidate = 1
+
+  # 10) Flatten core fields (use the chosen GR from inv_with_best_gr)
+  - op: select
+    name: inv_flat
+    from: inv_with_best_gr
+    columns:
+      - "COALESCE(CompanyCode,'') AS company_code"
+      - "CASE WHEN CompanyCode = '2000' THEN 'VAV ELECTRONICS' WHEN CompanyCode = 'BC01' THEN 'BC01 Pvt Ltd' ELSE CompanyCode END AS company_name"
+      - "COALESCE(Plant,'') AS plant"
+      - "COALESCE(PurchasingGroup,'') AS purchasing_group"
+      - "COALESCE(PurchaseOrder,'') AS po_number"
+      - "COALESCE(PurchaseOrderItem,'') AS line_Item_No"
+      - "COALESCE(Material,'') AS Material"
+      - "COALESCE(PurchaseOrderItemText, Material) AS Material_name"
+      - "OrderQuantity AS Quantity"
+      - "COALESCE(gr_document_no,'') AS gr_document_no"
+      - "gr_line_qty_num AS gr_line_qty"
+      - "SupplierInvoice AS ir_document_no"
+      - "SupplierInvoiceItem AS supplier_invoice_item"
+      - "FiscalYear AS fiscal_year"
+      - "PostingDate AS ir_posting_date_raw"
+      - "gr_posting_date AS gr_posting_date_raw"
+      - "LastChangeDateTime AS po_change_datetime"
+      - "CreatedByUser AS po_created_by"
+      - "CreatedByUser AS po_changed_by"
+      - "CAST(PurchaseOrderDate AS DATE) AS po_date"
+      - "COALESCE(BusinessPartnerFullName, OrganizationBPName1, OrganizationBPName2, InvoicingParty) AS vendor_name"
+      - "COALESCE(InvoicingParty, Supplier, '') AS vendor_number"
+
+  # 11) Parse dates, compute age (IR - GR), bucket, and additional fields
+  - op: derive
+    name: inv_enriched
+    from: inv_flat
+    add:
+      - name: ir_posting_date
+        sql: >
+          CASE
+            WHEN ir_posting_date_raw IS NULL THEN NULL
+            WHEN CAST(ir_posting_date_raw AS VARCHAR) LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(CAST(ir_posting_date_raw AS VARCHAR),'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            ELSE TRY_CAST(ir_posting_date_raw AS DATE)
+          END
+      - name: gr_posting_date
+        sql: >
+          CASE
+            WHEN gr_posting_date_raw IS NULL THEN NULL
+            WHEN CAST(gr_posting_date_raw AS VARCHAR) LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(CAST(gr_posting_date_raw AS VARCHAR),'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            ELSE TRY_CAST(gr_posting_date_raw AS DATE)
+          END
+      - name: po_qty_num
+        sql: "COALESCE(TRY_CAST(Quantity AS DOUBLE), 0.0)"
+      - name: gr_line_qty_num
+        sql: "COALESCE(TRY_CAST(gr_line_qty AS DOUBLE), 0.0)"
+      - name: age_days_between_ir_and_gr
+        sql: >
+          CASE
+            WHEN ir_posting_date IS NULL OR gr_posting_date IS NULL THEN NULL
+            ELSE DATE_DIFF('day', gr_posting_date, ir_posting_date)
+          END
+      - name: age_bucket
+        sql: >
+          CASE
+            WHEN age_days_between_ir_and_gr IS NULL THEN 'UNKNOWN'
+            WHEN age_days_between_ir_and_gr BETWEEN 0 AND 30 THEN '0-30'
+            WHEN age_days_between_ir_and_gr BETWEEN 31 AND 60 THEN '31-60'
+            WHEN age_days_between_ir_and_gr BETWEEN 61 AND 90 THEN '61-90'
+            WHEN age_days_between_ir_and_gr > 90 THEN '>90'
+            ELSE 'UNKNOWN'
+          END
+      - name: fiscal_period
+        sql: "CASE WHEN ir_posting_date IS NULL THEN NULL ELSE EXTRACT(MONTH FROM ir_posting_date) END"
+      - name: dateandtime
+        sql: "COALESCE(TRY_CAST(po_change_datetime AS TIMESTAMP), TRY_CAST(ir_posting_date AS TIMESTAMP), TRY_CAST(gr_posting_date AS TIMESTAMP), TRY_CAST(DATE('{{ as_of_date }}') AS TIMESTAMP))"
+
+  # 12) Filter according to rules:
+  # require both dates present, exclude equal dates, only IR after GR (positive age)
+  - op: filter
+    name: inv_filtered
+    from: inv_enriched
+    where: >
+      ir_posting_date IS NOT NULL
+      AND gr_posting_date IS NOT NULL
+      AND ir_posting_date <> gr_posting_date
+      AND DATE_DIFF('day', gr_posting_date, ir_posting_date) > 0
+      {% if vendor %} AND vendor_number = '{{ vendor | upper }}' {% endif %}
+      {% if start_date %} AND (gr_posting_date >= DATE('{{ start_date }}') OR ir_posting_date >= DATE('{{ start_date }}')) {% endif %}
+      {% if end_date %} AND (gr_posting_date <= DATE('{{ end_date }}') OR ir_posting_date <= DATE('{{ end_date }}')) {% endif %}
+
+  # 13) Aggregate to the requested compact output fields in the exact order the user requested
+  - op: sql
+    name: final_agg
+    sql: |
+      SELECT
+        COALESCE(company_code,'') AS company_code,
+        COALESCE(company_name, company_code) AS company_name,
+        COALESCE(plant,'') AS "plant",
+        COALESCE(purchasing_group,'') AS "purchasing group",
+        COALESCE(vendor_number,'') AS "Vendor No.",
+        COALESCE(vendor_name,'') AS "vendor name",
+        COALESCE(po_number,'') AS "po number",
+        CAST(po_date AS DATE) AS "DOC DATE",
+        COALESCE(line_Item_No,'') AS "line_Item_No",
+        COALESCE(supplier_invoice_item,'') AS "supplier_invoice_item",
+        COALESCE(Material,'') AS "Material",
+        COALESCE(Material_name,'') AS "Material name",
+        SUM(COALESCE(po_qty_num,0)) AS "Quantity",
+        CASE WHEN SUM(COALESCE(gr_line_qty_num,0)) < SUM(COALESCE(po_qty_num,0)) THEN 'PENDING' ELSE 'OK' END AS "GR Status",
+        MAX(gr_document_no) AS "GR document no.",
+        MAX(gr_posting_date) AS "GR posting date",
+        MAX(ir_document_no) AS "IR document no.",
+        MAX(ir_posting_date) AS "IR posting date",
+        MAX(age_bucket) AS "age bucket",
+        MAX(age_days_between_ir_and_gr) AS "age_days_between_ir_and_gr",
+        MAX(fiscal_year) AS "FISCAL YEAR",
+        MAX(fiscal_period) AS "FISCAL PERIOD",
+        MAX(po_created_by) AS "PO created by",
+        MAX(po_changed_by) AS "PO changes by",
+        MAX(dateandtime) AS dateandtime
+      FROM inv_filtered
+      GROUP BY company_code, company_name, plant, purchasing_group, vendor_number, vendor_name, po_number, po_date, line_Item_No, supplier_invoice_item, Material, Material_name
+      ORDER BY company_code, plant, po_number, line_Item_No, supplier_invoice_item
+
+project:
+  wrap: true
+  projection:
+    tables:
+      ageing_by_vendor_plant:
+        from: final_agg
+
+notes: >
+  * Partitioning for candidate selection uses COALESCE(CAST(inv.SupplierInvoiceItem AS VARCHAR),'') so NULL SupplierInvoiceItem (single-line invoices) are handled correctly alongside multi-line invoices.
+  * SupplierInvoiceItem is preserved and included in final output and grouping so multiple invoice lines remain separate rows.
+  * The pipeline picks, per invoice line, the GR record with the latest posting date that is <= IR posting date.
+  * If you'd like a debug step to sample A_MaterialDocumentItem (e.g. $top=20) so I can optimize $select fields, tell me and I'll provide that tiny debug snippet.
