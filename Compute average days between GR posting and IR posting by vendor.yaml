@@ -130,7 +130,8 @@ steps:
       ) AS gr_qty,
       CASE
         WHEN PostingDate IS NULL THEN NULL
-        WHEN PostingDate LIKE '/Date(%' THEN DATE(CAST((CAST(REGEXP_REPLACE(PostingDate,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+        WHEN PostingDate LIKE '/Date(%' THEN
+          CAST(CAST((CAST(REGEXP_REPLACE(PostingDate,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP) AS DATE)
         ELSE TRY_CAST(PostingDate AS DATE)
       END AS matdoc_posting_date
     FROM matdoc_joined
@@ -211,7 +212,7 @@ steps:
       sql: >
         CASE
           WHEN PostingDate LIKE '/Date(%' THEN
-            DATE(CAST((CAST(REGEXP_REPLACE(PostingDate,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP))
+            CAST(CAST((CAST(REGEXP_REPLACE(PostingDate,'[^0-9]','') AS BIGINT)/1000) AS TIMESTAMP) AS DATE)
           ELSE TRY_CAST(PostingDate AS DATE)
         END
     - name: gr_posting_date
