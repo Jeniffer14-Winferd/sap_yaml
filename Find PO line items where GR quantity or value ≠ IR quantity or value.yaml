@@ -1,0 +1,386 @@
+version: 1
+name: finance.po_line_gr_vs_ir_status.v3_8.duckdb
+description: >
+  Identify PO line items where GR vs IR quantities or values differ. IR Value taken from SupplierInvoiceItemAmount (matches ME23N "Amount"). Vendor Name from A_Supplier.SupplierName (fallback to A_BusinessPartner). Includes Posted GR + Posted IR only, enriched with Company Name + Accounting Document.
+
+params:
+  vendor: ""
+  vendor_query: ""
+  po: ""
+  plant: ""
+  company_code: ""
+  start_posting_date: ""
+  end_posting_date: ""
+  top: ""
+
+steps:
+
+# ---------------------------------------------------------
+# 1) PO Items + Header
+# ---------------------------------------------------------
+- op: fetch
+  name: po_items_raw
+  source: sap
+  service: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem
+  query_params:
+    $format: json
+    $select: >
+      PurchaseOrder,PurchaseOrderItem,Plant,Material, PurchaseOrderItemText,DocumentCurrency,OrderQuantity, NetPriceAmount,NetPriceQuantity
+    $orderby: PurchaseOrder,PurchaseOrderItem
+
+- op: fetch
+  name: po_header_raw
+  source: sap
+  service: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder
+  filter: >
+    {%- if company_code != '' -%} CompanyCode eq '{{ company_code }}' {%- endif -%}
+  query_params:
+    $format: json
+    $select: PurchaseOrder,Supplier,DocumentCurrency,CompanyCode
+
+# ---------------------------------------------------------
+# 2) Vendor Name (A_Supplier + A_BusinessPartner) and Company Name
+# ---------------------------------------------------------
+- op: fetch
+  name: supplier_raw
+  source: sap
+  service: API_BUSINESS_PARTNER/A_Supplier
+  query_params:
+    $format: json
+    $select: Supplier,SupplierName
+
+- op: fetch
+  name: bp_raw
+  source: sap
+  service: API_BUSINESS_PARTNER/A_BusinessPartner
+  query_params:
+    $format: json
+    $select: BusinessPartner,BusinessPartnerName
+
+- op: sql
+  name: vendor_names
+  sql: |
+    WITH s AS (
+      SELECT LPAD(CAST(Supplier AS VARCHAR),10,'0') AS Key10,
+             NULLIF(SupplierName,'') AS SupplierName
+      FROM supplier_raw
+    ),
+    b AS (
+      SELECT LPAD(CAST(BusinessPartner AS VARCHAR),10,'0') AS Key10,
+             MAX(NULLIF(BusinessPartnerName,'')) AS BPName
+      FROM bp_raw
+      GROUP BY 1
+    )
+    SELECT
+      COALESCE(s.Key10,b.Key10) AS Key10,
+      COALESCE(s.SupplierName,b.BPName) AS VendorName
+    FROM s
+    FULL OUTER JOIN b ON s.Key10 = b.Key10
+
+- op: fetch
+  name: company_raw
+  source: sap
+  service: API_COMPANYCODE_SRV/A_CompanyCode
+  query_params:
+    $format: json
+    $select: CompanyCode,CompanyCodeName
+
+# ---------------------------------------------------------
+# 3) Combine PO + Header + Vendor/Company
+# ---------------------------------------------------------
+- op: sql
+  name: po_items
+  sql: |
+    SELECT
+      i.PurchaseOrder,
+      i.PurchaseOrderItem,
+      h.Supplier AS Vendor,
+      vn.VendorName,
+      h.CompanyCode,
+      c.CompanyCodeName AS CompanyName,
+      i.Plant,
+      i.Material,
+      i.PurchaseOrderItemText AS MaterialName,
+      COALESCE(i.DocumentCurrency, h.DocumentCurrency) AS PO_Currency,
+      CAST(i.OrderQuantity AS DOUBLE) AS po_qty,
+      CASE WHEN TRY_CAST(i.NetPriceQuantity AS DOUBLE) <> 0
+           THEN CAST(i.NetPriceAmount AS DOUBLE) / CAST(i.NetPriceQuantity AS DOUBLE)
+      END AS po_unit_price,
+      CAST(i.OrderQuantity AS DOUBLE) *
+        (CAST(i.NetPriceAmount AS DOUBLE) / NULLIF(CAST(i.NetPriceQuantity AS DOUBLE),0)) AS po_value
+    FROM po_items_raw i
+    LEFT JOIN po_header_raw h
+      ON i.PurchaseOrder = h.PurchaseOrder
+    LEFT JOIN vendor_names vn
+      ON LPAD(CAST(h.Supplier AS VARCHAR),10,'0') = vn.Key10
+    LEFT JOIN company_raw c
+      ON h.CompanyCode = c.CompanyCode
+    WHERE 1=1
+      {%- if po != '' %}    AND i.PurchaseOrder = '{{ po }}' {%- endif %}
+      {%- if plant != '' %} AND i.Plant = '{{ plant }}' {%- endif %}
+      {%- if vendor != '' %} AND LPAD(CAST(h.Supplier AS VARCHAR),10,'0') = LPAD('{{ vendor }}',10,'0') {%- endif %}
+      {%- if vendor_query != '' %} AND LOWER(vn.VendorName) LIKE '%' || LOWER('{{ vendor_query }}') || '%' {%- endif %}
+      {%- if company_code != '' %} AND h.CompanyCode = '{{ company_code }}' {%- endif %}
+
+# ---------------------------------------------------------
+# 4) Goods Receipts (GR)
+# ---------------------------------------------------------
+- op: fetch
+  name: gr_item_raw
+  source: sap
+  service: API_MATERIAL_DOCUMENT_SRV/A_MaterialDocumentItem
+  query_params:
+    $format: json
+    $select: >
+      MaterialDocument,MaterialDocumentYear,PurchaseOrder,PurchaseOrderItem, GoodsMovementType,GoodsMovementIsCancelled,QuantityInBaseUnit,Plant,Material
+
+- op: fetch
+  name: gr_header_raw
+  source: sap
+  service: API_MATERIAL_DOCUMENT_SRV/A_MaterialDocumentHeader
+  query_params:
+    $format: json
+    $select: MaterialDocument,MaterialDocumentYear,PostingDate
+
+- op: sql
+  name: gr_valid
+  sql: |
+    SELECT
+      gi.PurchaseOrder,
+      gi.PurchaseOrderItem,
+      TRY_CAST(gh.PostingDate AS DATE) AS PostingDate,
+      CAST(gi.QuantityInBaseUnit AS DOUBLE) AS qty_gr,
+      gi.MaterialDocument AS gr_number
+    FROM gr_item_raw gi
+    JOIN gr_header_raw gh
+      ON gi.MaterialDocument = gh.MaterialDocument
+     AND gi.MaterialDocumentYear = gh.MaterialDocumentYear
+    WHERE gi.GoodsMovementIsCancelled = 'false'
+      AND gi.GoodsMovementType IN ('101','103','105')
+      {%- if start_posting_date != '' %} AND TRY_CAST(gh.PostingDate AS DATE) >= DATE '{{ start_posting_date }}' {%- endif %}
+      {%- if end_posting_date   != '' %} AND TRY_CAST(gh.PostingDate AS DATE) <= DATE '{{ end_posting_date }}'   {%- endif %}
+
+- op: sql
+  name: gr_agg
+  sql: |
+    SELECT
+      PurchaseOrder,
+      PurchaseOrderItem,
+      SUM(qty_gr) AS gr_qty,
+      MAX(PostingDate) AS latest_gr_posting,
+      MAX(gr_number) AS gr_number,
+      CASE WHEN SUM(qty_gr) > 0 THEN 'Posted' ELSE 'Not Posted' END AS gr_status
+    FROM gr_valid
+    GROUP BY 1,2
+
+# ---------------------------------------------------------
+# 5) Invoice Receipts (IR)
+# ---------------------------------------------------------
+- op: fetch
+  name: ir_item_raw
+  source: sap
+  service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SuplrInvcItemPurOrdRef
+  query_params:
+    $format: json
+    $select: >
+      SupplierInvoice,FiscalYear,PurchaseOrder,PurchaseOrderItem, SupplierInvoiceItemAmount,QuantityInPurchaseOrderUnit,DocumentCurrency
+
+- op: fetch
+  name: ir_header_raw
+  source: sap
+  service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice
+  filter: >
+    {%- if company_code != '' -%} CompanyCode eq '{{ company_code }}' {%- endif -%}
+  query_params:
+    $format: json
+    $select: SupplierInvoice,FiscalYear,PostingDate,CompanyCode
+
+- op: sql
+  name: ir_agg
+  sql: |
+    SELECT
+      ii.PurchaseOrder,
+      ii.PurchaseOrderItem,
+      MAX(ih.CompanyCode) AS company_code,
+      MAX(ih.FiscalYear)  AS fiscal_year,
+      MAX(ii.SupplierInvoice) AS ir_number,
+      SUM(CAST(ii.QuantityInPurchaseOrderUnit AS DOUBLE)) AS ir_qty,
+      SUM(CAST(ii.SupplierInvoiceItemAmount AS DOUBLE))   AS ir_value,
+      MAX(TRY_CAST(ih.PostingDate AS DATE)) AS latest_ir_posting,
+      CASE WHEN SUM(CAST(ii.QuantityInPurchaseOrderUnit AS DOUBLE)) > 0 THEN 'Posted' ELSE 'Not Posted' END AS invoice_status
+    FROM ir_item_raw ii
+    JOIN ir_header_raw ih
+      ON ii.SupplierInvoice = ih.SupplierInvoice
+     AND ii.FiscalYear      = ih.FiscalYear
+    WHERE 1=1
+      {%- if start_posting_date != '' %} AND TRY_CAST(ih.PostingDate AS DATE) >= DATE '{{ start_posting_date }}' {%- endif %}
+      {%- if end_posting_date   != '' %} AND TRY_CAST(ih.PostingDate AS DATE) <= DATE '{{ end_posting_date }}'   {%- endif %}
+    GROUP BY 1,2
+
+# ---------------------------------------------------------
+# 6) FI Accounting Document mapping (for reference)
+# ---------------------------------------------------------
+- op: fetch
+  name: gl_items_raw
+  source: sap
+  service: API_GLACCOUNTLINEITEM/GLAccountLineItem
+  filter: >
+    {%- if company_code != '' -%} CompanyCode eq '{{ company_code }}' {%- endif -%}
+  query_params:
+    $format: json
+    $select: >
+      CompanyCode,FiscalYear,AccountingDocument, InvoiceReference,InvoiceReferenceFiscalYear, PurchasingDocument,PurchasingDocumentItem
+
+- op: sql
+  name: gl_map
+  sql: |
+    WITH by_inv AS (
+      SELECT
+        CompanyCode,
+        FiscalYear,
+        AccountingDocument,
+        InvoiceReference,
+        InvoiceReferenceFiscalYear,
+        PurchasingDocument,
+        PurchasingDocumentItem,
+        ROW_NUMBER() OVER (
+          PARTITION BY CompanyCode, InvoiceReference, InvoiceReferenceFiscalYear
+          ORDER BY AccountingDocument DESC
+        ) AS rn
+      FROM gl_items_raw
+      WHERE InvoiceReference IS NOT NULL AND InvoiceReference <> ''
+    ),
+    by_po AS (
+      SELECT
+        CompanyCode,
+        FiscalYear,
+        AccountingDocument,
+        PurchasingDocument,
+        PurchasingDocumentItem,
+        ROW_NUMBER() OVER (
+          PARTITION BY CompanyCode, PurchasingDocument, PurchasingDocumentItem
+          ORDER BY AccountingDocument DESC
+        ) AS rn
+      FROM gl_items_raw
+    )
+    SELECT
+      CompanyCode,
+      FiscalYear,
+      AccountingDocument,
+      InvoiceReference,
+      InvoiceReferenceFiscalYear,
+      PurchasingDocument,
+      PurchasingDocumentItem
+    FROM by_inv WHERE rn = 1
+    UNION ALL
+    SELECT
+      CompanyCode,
+      FiscalYear,
+      AccountingDocument,
+      NULL AS InvoiceReference,
+      NULL AS InvoiceReferenceFiscalYear,
+      PurchasingDocument,
+      PurchasingDocumentItem
+    FROM by_po WHERE rn = 1
+
+# ---------------------------------------------------------
+# 7) Combine & compute differences
+# ---------------------------------------------------------
+- op: sql
+  name: gr_ir_compared
+  sql: |
+    WITH base AS (
+      SELECT
+        p.PurchaseOrder,
+        p.PurchaseOrderItem,
+        p.Vendor,
+        p.VendorName,
+        p.CompanyCode,
+        p.CompanyName,
+        p.Material,
+        p.MaterialName,
+        p.Plant,
+        p.PO_Currency,
+        p.po_qty,
+        p.po_value,
+        g.gr_qty,
+        g.gr_number,
+        g.latest_gr_posting,
+        g.gr_status,
+        i.ir_qty,
+        i.ir_number,
+        i.company_code AS company_code_fi,
+        i.fiscal_year  AS fiscal_year_fi,
+        i.latest_ir_posting,
+        i.invoice_status,
+        CASE WHEN p.po_unit_price IS NOT NULL THEN g.gr_qty * p.po_unit_price END AS gr_value,
+        i.ir_value AS ir_value,
+        (g.gr_qty - i.ir_qty) AS qty_diff,
+        CASE
+          WHEN p.po_unit_price IS NOT NULL AND i.ir_value IS NOT NULL
+          THEN (g.gr_qty * p.po_unit_price) - i.ir_value
+        END AS value_diff
+      FROM po_items p
+      LEFT JOIN gr_agg g
+        ON p.PurchaseOrder = g.PurchaseOrder AND p.PurchaseOrderItem = g.PurchaseOrderItem
+      LEFT JOIN ir_agg i
+        ON p.PurchaseOrder = i.PurchaseOrder AND p.PurchaseOrderItem = i.PurchaseOrderItem
+      WHERE g.gr_status = 'Posted' AND i.invoice_status = 'Posted'
+    )
+    SELECT
+      b.*,
+      gm.AccountingDocument AS accounting_document_fi
+    FROM base b
+    LEFT JOIN gl_map gm
+      ON (
+            gm.InvoiceReference = b.ir_number
+          AND gm.CompanyCode    = b.company_code_fi
+          AND gm.FiscalYear     = b.fiscal_year_fi
+         )
+      OR (
+            gm.PurchasingDocument     = b.PurchaseOrder
+        AND gm.PurchasingDocumentItem = b.PurchaseOrderItem
+      )
+
+# ---------------------------------------------------------
+# 8) Final Ordered Output
+# ---------------------------------------------------------
+- op: sql
+  name: result
+  sql: |
+    SELECT
+      CompanyCode              AS "Company Code",
+      CompanyName              AS "Company Name",
+      Plant                    AS "Plant",
+      Vendor                   AS "Vendor",
+      VendorName               AS "Vendor Name",
+      PurchaseOrder            AS "PO Number",
+      PurchaseOrderItem        AS "PO Item",
+      Material                 AS "Material",
+      MaterialName             AS "Material Name",
+      po_qty                   AS "PO Qty",
+      po_value                 AS "PO Value",
+      PO_Currency              AS "Currency",
+      gr_qty                   AS "GR Qty",
+      ir_qty                   AS "IR Qty",
+      qty_diff                 AS "Qty Diff",
+      gr_value                 AS "GR Value",
+      ir_value                 AS "IR Value",
+      value_diff               AS "GRIR Value Diff",
+      gr_status                AS "GR Status",
+      invoice_status           AS "Invoice Status",
+      gr_number                AS "GR Number",
+      ir_number                AS "IR Number",
+      latest_gr_posting        AS "GR Posting Date",
+      latest_ir_posting        AS "Invoice Posting Date",
+      accounting_document_fi   AS "Accounting Document",
+      fiscal_year_fi           AS "Fiscal Year"
+    FROM gr_ir_compared
+    WHERE ABS(qty_diff) > 0.0001
+       OR (value_diff IS NOT NULL AND ABS(value_diff) > 0.005)
+    {%- if company_code != '' %} AND CompanyCode = '{{ company_code }}' {%- endif %}
+    ORDER BY
+      ABS(COALESCE(value_diff, 0)) DESC,
+      ABS(qty_diff) DESC,
+      "PO Number", "PO Item"
+    {%- if top != '' %} LIMIT {{ top | int }} {%- endif %}
