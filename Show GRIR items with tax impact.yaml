@@ -1,0 +1,408 @@
+version: 1
+name: finance.grir_with_tax_grposted_irnotposted.v1.duckdb
+description: >
+  GR/IR with PO, GR, IR values and tax fields filtered to only show line items where GR Status = 'Posted' and IR Status = 'Not Posted'. Tax resolution: first use pricing element tax amounts (BT01/BT02, GST keywords), else map PO TaxCode using the provided SAP set: A0/IX/V0/Z1 → 0%, B1/B2/B3/B4 → 18%, V8 → 21%, Z2 → 1%. When tax_policy=strict, no defaults are applied and rows with empty PO TaxCode are hidden.
+
+params:
+  vendor: ""
+  vendor_query: ""
+  po: ""
+  plant: ""
+  start_posting_date: ""
+  end_posting_date: ""
+  company_code: ""
+  top: ""
+  print_rows: 0
+
+  tax_policy: "strict" # strict | defaults | infer
+  default_tax_code: "" # used only when tax_policy=defaults or infer
+  default_tax_rate: "" # used only when tax_policy=defaults or infer (e.g., "18")
+  tax_like_patterns: "IGST,CGST,SGST,UTGST,GST,VAT,MWST,J%,ZGST,SVAT"
+  tax_condition_types: "BT01,BT02"
+
+steps:
+
+# 1) PO Items + Header
+- op: fetch
+  name: po_items_raw
+  source: sap
+  service: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderItem
+  query_params:
+    $format: json
+    $select: >
+      PurchaseOrder,PurchaseOrderItem,Plant,Material,PurchaseOrderItemText, DocumentCurrency,OrderQuantity,NetPriceAmount,NetPriceQuantity,TaxCode
+    $orderby: "PurchaseOrder asc, PurchaseOrderItem asc"
+
+- op: fetch
+  name: po_header_raw
+  source: sap
+  service: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder
+  query_params:
+    $format: json
+    $select: PurchaseOrder,Supplier,DocumentCurrency,CompanyCode
+
+# 2) Vendor & Company
+- op: fetch
+  name: supplier_raw
+  source: sap
+  service: API_BUSINESS_PARTNER/A_Supplier
+  query_params:
+    $format: json
+    $select: Supplier,SupplierName
+
+- op: fetch
+  name: bp_raw
+  source: sap
+  service: API_BUSINESS_PARTNER/A_BusinessPartner
+  query_params:
+    $format: json
+    $select: BusinessPartner,BusinessPartnerName
+
+- op: sql
+  name: vendor_names
+  sql: |
+    WITH s AS (
+      SELECT LPAD(CAST(Supplier AS VARCHAR),10,'0') AS Key10,
+             NULLIF(SupplierName,'') AS SupplierName
+      FROM supplier_raw
+    ),
+    b AS (
+      SELECT LPAD(CAST(BusinessPartner AS VARCHAR),10,'0') AS Key10,
+             MAX(NULLIF(BusinessPartnerName,'')) AS BPName
+      FROM bp_raw
+      GROUP BY 1
+    )
+    SELECT COALESCE(s.Key10,b.Key10) AS Key10,
+           COALESCE(s.SupplierName,b.BPName) AS VendorName
+    FROM s FULL OUTER JOIN b ON s.Key10 = b.Key10
+
+- op: fetch
+  name: company_raw
+  source: sap
+  service: API_COMPANYCODE_SRV/A_CompanyCode
+  query_params:
+    $format: json
+    $select: CompanyCode,CompanyCodeName,Country
+
+# 3) Pricing Elements
+- op: fetch
+  name: pricing_raw
+  source: sap
+  service: API_PURCHASEORDER_PROCESS_SRV/A_PurOrdPricingElement
+  query_params:
+    $format: json
+    $select: PurchaseOrder,PurchaseOrderItem,ConditionType,ConditionAmount,ConditionCurrency
+
+- op: sql
+  name: pricing_tax_agg
+  sql: |
+    WITH kw AS (
+      SELECT TRIM(UPPER(x)) AS pat
+      FROM UNNEST(STRING_SPLIT('{{ tax_like_patterns }}', ',')) AS t(x)
+    ),
+    ct AS (
+      SELECT TRIM(UPPER(x)) AS ctype
+      FROM UNNEST(STRING_SPLIT('{{ tax_condition_types }}', ',')) AS t(x)
+    ),
+    pe AS (
+      SELECT
+        PurchaseOrder,
+        PurchaseOrderItem,
+        UPPER(COALESCE(ConditionType,'')) AS condtype,
+        ABS(TRY_CAST(ConditionAmount AS DOUBLE)) AS amt,
+        COALESCE(ConditionCurrency,'') AS curr
+      FROM pricing_raw
+    )
+    SELECT
+      p.PurchaseOrder,
+      p.PurchaseOrderItem,
+      SUM(
+        CASE
+          WHEN p.curr <> '' AND (
+               EXISTS (SELECT 1 FROM kw k WHERE p.condtype LIKE REPLACE(k.pat,'%','%%'))
+            OR EXISTS (SELECT 1 FROM ct c WHERE p.condtype = c.ctype)
+          )
+          THEN COALESCE(p.amt,0) ELSE 0
+        END
+      ) AS pricing_tax_amount
+    FROM pe p
+    GROUP BY 1,2
+
+# 4) Normalize PO + Resolve Tax (exact mapping)
+- op: sql
+  name: po_items
+  sql: |
+    WITH base AS (
+      SELECT
+        i.PurchaseOrder,
+        i.PurchaseOrderItem,
+        h.Supplier AS Vendor,
+        COALESCE(i.DocumentCurrency, h.DocumentCurrency) AS PO_Currency,
+        i.Plant,
+        i.Material,
+        i.PurchaseOrderItemText AS MaterialName,
+        CAST(i.OrderQuantity    AS DOUBLE) AS po_qty,
+        CAST(i.NetPriceAmount   AS DOUBLE) AS po_net_price_amount,
+        CAST(i.NetPriceQuantity AS DOUBLE) AS po_net_price_quantity,
+        NULLIF(UPPER(TRIM(i.TaxCode)),'') AS po_tax_code_raw,
+        h.CompanyCode
+      FROM po_items_raw i
+      LEFT JOIN po_header_raw h ON i.PurchaseOrder = h.PurchaseOrder
+    ),
+    code_rate_map AS (
+      SELECT
+        b.PurchaseOrder, b.PurchaseOrderItem, b.po_tax_code_raw,
+        CASE
+          WHEN b.po_tax_code_raw IN ('A0','IX','V0','Z1') THEN 0.0
+          WHEN b.po_tax_code_raw IN ('B1','B2','B3','B4') THEN 18.0
+          WHEN b.po_tax_code_raw = 'V8' THEN 21.0
+          WHEN b.po_tax_code_raw = 'Z2' THEN 1.0
+          ELSE NULL
+        END AS rate_from_code
+      FROM base b
+    ),
+    joined AS (
+      SELECT
+        b.*,
+        pta.pricing_tax_amount,
+        crm.rate_from_code
+      FROM base b
+      LEFT JOIN pricing_tax_agg pta
+        ON b.PurchaseOrder = pta.PurchaseOrder AND b.PurchaseOrderItem = pta.PurchaseOrderItem
+      LEFT JOIN code_rate_map crm
+        ON b.PurchaseOrder = crm.PurchaseOrder AND b.PurchaseOrderItem = crm.PurchaseOrderItem
+    ),
+    computed AS (
+      SELECT
+        j.*,
+        CASE
+          WHEN j.po_net_price_quantity IS NOT NULL AND j.po_net_price_quantity <> 0
+            THEN j.po_net_price_amount / j.po_net_price_quantity
+          WHEN j.po_qty IS NOT NULL AND j.po_qty <> 0
+            THEN j.po_net_price_amount / j.po_qty
+        END AS po_unit_price,
+        CASE
+          WHEN j.po_net_price_quantity IS NOT NULL AND j.po_net_price_quantity <> 0
+            THEN j.po_qty * (j.po_net_price_amount / j.po_net_price_quantity)
+          WHEN j.po_qty IS NOT NULL AND j.po_qty <> 0
+            THEN j.po_qty * (j.po_net_price_amount / j.po_qty)
+        END AS po_value
+      FROM joined j
+    ),
+    rate_from_amount AS (
+      SELECT
+        c.*,
+        CASE
+          WHEN c.po_value IS NOT NULL AND c.po_value <> 0
+               AND c.pricing_tax_amount IS NOT NULL AND c.pricing_tax_amount <> 0
+            THEN 100.0 * (c.pricing_tax_amount / c.po_value)
+          ELSE NULL
+        END AS rate_from_amount_pct
+      FROM computed c
+    ),
+    policy AS (
+      SELECT
+        '{{ tax_policy }}'::VARCHAR AS mode,
+        NULLIF(UPPER(TRIM('{{ default_tax_code }}')),'') AS def_code,
+        TRY_CAST(NULLIF('{{ default_tax_rate }}','') AS DOUBLE) AS def_rate
+    ),
+    final_po AS (
+      SELECT
+        r.*,
+        CASE
+          WHEN (SELECT mode FROM policy) = 'strict'
+            THEN COALESCE(r.rate_from_amount_pct, r.rate_from_code)
+          WHEN (SELECT mode FROM policy) IN ('defaults','infer')
+            THEN COALESCE(r.rate_from_amount_pct, r.rate_from_code, (SELECT def_rate FROM policy), 0.0)
+          ELSE COALESCE(r.rate_from_amount_pct, r.rate_from_code)
+        END AS final_rate_pct,
+        CASE
+          WHEN (SELECT mode FROM policy) = 'strict'
+            THEN COALESCE(r.po_tax_code_raw, '')
+          WHEN (SELECT mode FROM policy) = 'defaults'
+            THEN COALESCE(r.po_tax_code_raw, (SELECT def_code FROM policy), '')
+          WHEN (SELECT mode FROM policy) = 'infer'
+            THEN COALESCE(
+                   r.po_tax_code_raw,
+                   CASE
+                     WHEN ABS(COALESCE(r.rate_from_amount_pct, r.rate_from_code, (SELECT def_rate FROM policy)) - 0)  < 0.5 THEN 'A0'
+                     WHEN ABS(COALESCE(r.rate_from_amount_pct, r.rate_from_code, (SELECT def_rate FROM policy)) - 5)  < 0.5 THEN 'B5'
+                     WHEN ABS(COALESCE(r.rate_from_amount_pct, r.rate_from_code, (SELECT def_rate FROM policy)) - 12) < 0.5 THEN 'B12'
+                     WHEN ABS(COALESCE(r.rate_from_amount_pct, r.rate_from_code, (SELECT def_rate FROM policy)) - 18) < 0.5 THEN 'B1'
+                     WHEN ABS(COALESCE(r.rate_from_amount_pct, r.rate_from_code, (SELECT def_rate FROM policy)) - 28) < 0.5 THEN 'B2'
+                     ELSE (SELECT def_code FROM policy)
+                   END,
+                   ''
+                 )
+          ELSE COALESCE(r.po_tax_code_raw, '')
+        END AS final_code
+      FROM rate_from_amount r
+    )
+    SELECT
+      f.PurchaseOrder,
+      f.PurchaseOrderItem,
+      h.Supplier AS Vendor,
+      f.CompanyCode,
+      i.Plant,
+      i.Material,
+      i.MaterialName,
+      COALESCE(i.PO_Currency, h.DocumentCurrency) AS PO_Currency,
+      i.po_qty,
+      i.po_net_price_quantity,
+      i.po_net_price_amount,
+      i.po_unit_price,
+      i.po_value,
+      f.final_code       AS po_tax_code,
+      f.final_rate_pct   AS resolved_tax_rate_pct
+    FROM final_po f
+    JOIN computed i
+      ON f.PurchaseOrder = i.PurchaseOrder AND f.PurchaseOrderItem = i.PurchaseOrderItem
+    LEFT JOIN po_header_raw h ON i.PurchaseOrder = h.PurchaseOrder
+    WHERE 1=1
+      {%- if po != '' %}          AND i.PurchaseOrder = '{{ po }}'           {%- endif %}
+      {%- if plant != '' %}       AND i.Plant = '{{ plant }}'                {%- endif %}
+      {%- if company_code != '' %}AND h.CompanyCode = '{{ company_code }}'   {%- endif %}
+
+# 5) GR Data
+- op: fetch
+  name: gr_item_raw
+  source: sap
+  service: API_MATERIAL_DOCUMENT_SRV/A_MaterialDocumentItem
+  query_params:
+    $format: json
+    $select: >
+      MaterialDocument,MaterialDocumentYear,PurchaseOrder,PurchaseOrderItem, GoodsMovementType,GoodsMovementIsCancelled,QuantityInBaseUnit,Plant,Material
+
+- op: fetch
+  name: gr_header_raw
+  source: sap
+  service: API_MATERIAL_DOCUMENT_SRV/A_MaterialDocumentHeader
+  query_params:
+    $format: json
+    $select: MaterialDocument,MaterialDocumentYear,PostingDate
+
+- op: sql
+  name: gr_valid
+  sql: |
+    SELECT
+      gi.PurchaseOrder,
+      gi.PurchaseOrderItem,
+      TRY_CAST(gh.PostingDate AS DATE) AS PostingDate,
+      CAST(gi.QuantityInBaseUnit AS DOUBLE) AS qty_gr,
+      gi.MaterialDocument AS gr_number
+    FROM gr_item_raw gi
+    JOIN gr_header_raw gh
+      ON gi.MaterialDocument = gh.MaterialDocument
+     AND gi.MaterialDocumentYear = gh.MaterialDocumentYear
+    WHERE gi.GoodsMovementIsCancelled = 'false'
+      AND gi.GoodsMovementType IN ('101','103','105')
+      {%- if start_posting_date != '' %} AND TRY_CAST(gh.PostingDate AS DATE) >= DATE '{{ start_posting_date }}' {%- endif %}
+      {%- if end_posting_date   != '' %} AND TRY_CAST(gh.PostingDate AS DATE) <= DATE '{{ end_posting_date }}'   {%- endif %}
+
+- op: sql
+  name: gr_agg
+  sql: |
+    SELECT
+      PurchaseOrder,
+      PurchaseOrderItem,
+      SUM(qty_gr) AS gr_qty,
+      MAX(PostingDate) AS latest_gr_posting,
+      MAX(gr_number) AS gr_number,
+      CASE WHEN SUM(qty_gr) > 0 THEN 'Posted' ELSE 'Not Posted' END AS gr_status
+    FROM gr_valid
+    GROUP BY 1,2
+
+# 6) IR Data
+- op: fetch
+  name: ir_item_raw
+  source: sap
+  service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SuplrInvcItemPurOrdRef
+  query_params:
+    $format: json
+    $select: >
+      SupplierInvoice,FiscalYear,PurchaseOrder,PurchaseOrderItem, SupplierInvoiceItemAmount,QuantityInPurchaseOrderUnit,DocumentCurrency
+
+- op: fetch
+  name: ir_header_raw
+  source: sap
+  service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice
+  query_params:
+    $format: json
+    $select: SupplierInvoice,FiscalYear,PostingDate,CompanyCode
+
+- op: sql
+  name: ir_agg
+  sql: |
+    SELECT
+      ii.PurchaseOrder,
+      ii.PurchaseOrderItem,
+      MAX(ih.CompanyCode) AS company_code,
+      MAX(ii.SupplierInvoice) AS ir_number,
+      SUM(CAST(ii.QuantityInPurchaseOrderUnit AS DOUBLE)) AS ir_qty,
+      SUM(CAST(ii.SupplierInvoiceItemAmount AS DOUBLE))   AS ir_value_ex_tax,
+      MAX(TRY_CAST(ih.PostingDate AS DATE)) AS latest_ir_posting,
+      CASE WHEN SUM(CAST(ii.QuantityInPurchaseOrderUnit AS DOUBLE)) > 0 THEN 'Posted' ELSE 'Not Posted' END AS invoice_status
+    FROM ir_item_raw ii
+    JOIN ir_header_raw ih
+      ON ii.SupplierInvoice = ih.SupplierInvoice
+     AND ii.FiscalYear      = ih.FiscalYear
+    WHERE 1=1
+      {%- if start_posting_date != '' %} AND TRY_CAST(ih.PostingDate AS DATE) >= DATE '{{ start_posting_date }}' {%- endif %}
+      {%- if end_posting_date   != '' %} AND TRY_CAST(ih.PostingDate AS DATE) <= DATE '{{ end_posting_date }}'   {%- endif %}
+      {%- if company_code != '' %} AND ih.CompanyCode = '{{ company_code }}' {%- endif %}
+    GROUP BY 1,2
+
+# 7) Final Result
+- op: sql
+  name: result
+  sql: |
+    WITH i AS (SELECT * FROM po_items)
+    SELECT
+      p.CompanyCode                         AS "Company Code",
+      c.CompanyCodeName                     AS "Company Name",
+      p.Plant                               AS "Plant",
+      p.Vendor                              AS "Vendor",
+      vn.VendorName                         AS "Vendor Name",
+      p.PurchaseOrder                       AS "PO Number",
+      p.PurchaseOrderItem                   AS "PO Item",
+      p.Material                            AS "Material",
+      p.MaterialName                        AS "Material Name",
+      p.PO_Currency                         AS "Currency",
+      p.po_qty                              AS "PO Qty",
+      p.po_net_price_quantity               AS "PO NetPriceQuantity",
+      p.po_net_price_amount                 AS "PO NetPriceAmount",
+      p.po_unit_price                       AS "PO Unit Price",
+      p.po_value                            AS "PO Value (ex-tax)",
+      COALESCE(g.gr_qty,0)                  AS "GR Qty",
+      CASE WHEN p.po_unit_price IS NOT NULL
+           THEN COALESCE(g.gr_qty,0) * p.po_unit_price
+      END                                   AS "GR Value (ex-tax)",
+      COALESCE(ir.ir_qty,0)                 AS "IR Qty",
+      COALESCE(ir.ir_value_ex_tax,0)        AS "IR Value (ex-tax)",
+      (COALESCE(g.gr_qty,0) - COALESCE(ir.ir_qty,0)) AS "Qty Diff",
+      (COALESCE(ir.ir_value_ex_tax,0) - p.po_value)  AS "Diff ex-tax",
+      ROUND(((COALESCE(ir.ir_value_ex_tax,0)/NULLIF(p.po_value,0))-1)*100,2) AS "IR vs PO % Over (ex-tax)",
+      g.gr_status                           AS "GR Status",
+      COALESCE(ir.invoice_status,'Not Posted') AS "IR Status",
+      g.gr_number                           AS "GR Number",
+      COALESCE(ir.ir_number,'')             AS "IR Number",
+      g.latest_gr_posting                   AS "GR Posting Date",
+      ir.latest_ir_posting                  AS "Invoice Posting Date",
+      p.po_tax_code                         AS "PO Tax Code",
+      p.resolved_tax_rate_pct               AS "Tax Rate (%)",
+      CASE WHEN p.po_unit_price IS NOT NULL
+           THEN (COALESCE(g.gr_qty,0) * p.po_unit_price) * (p.resolved_tax_rate_pct / 100.0)
+           ELSE NULL
+      END                                   AS "GR Tax Value"
+    FROM i p
+    LEFT JOIN gr_agg g   ON p.PurchaseOrder = g.PurchaseOrder AND p.PurchaseOrderItem = g.PurchaseOrderItem
+    LEFT JOIN ir_agg ir  ON p.PurchaseOrder = ir.PurchaseOrder AND p.PurchaseOrderItem = ir.PurchaseOrderItem
+    LEFT JOIN company_raw c   ON p.CompanyCode = c.CompanyCode
+    LEFT JOIN vendor_names vn ON LPAD(CAST(p.Vendor AS VARCHAR),10,'0') = vn.Key10
+    WHERE g.gr_status = 'Posted'
+      AND COALESCE(ir.invoice_status,'Not Posted') = 'Not Posted'
+      AND (UPPER('{{ tax_policy }}') <> 'STRICT' OR p.po_tax_code <> '')
+      {%- if vendor != '' %} AND LPAD(CAST(p.Vendor AS VARCHAR),10,'0') = LPAD('{{ vendor }}',10,'0') {%- endif %}
+      {%- if vendor_query != '' %} AND LOWER(vn.VendorName) LIKE '%' || LOWER('{{ vendor_query }}') || '%' {%- endif %}
+    ORDER BY p.PurchaseOrder, p.PurchaseOrderItem
+    {%- if top != '' %} LIMIT {{ top | int }} {%- endif %}
