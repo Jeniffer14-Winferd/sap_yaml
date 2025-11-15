@@ -1,5 +1,3 @@
-#Find GRIR entries where invoice value >10% over PO value
-
 version: 1
 name: finance.grir_ir_over_po_10pct.v1.duckdb
 description: >
