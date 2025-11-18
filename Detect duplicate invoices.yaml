@@ -1,0 +1,329 @@
+version: 1
+name: finance.duplicate_invoices.v3_5.duckdb
+description: >
+  Detect potential duplicate supplier invoices using API_SUPPLIERINVOICE_PROCESS_SRV and enrich Accounting Document numbers via API_GLACCOUNTLINEITEM. Supports filters for company code, vendor, vendor name (contains), PO and posting date range.
+
+  Duplicate detection rules:
+    - VENDOR_REF:
+        Same Vendor (InvoicingParty)
+        + Same Vendor Invoice Reference (SupplierInvoiceIDByInvcgParty)
+        + Same Currency
+        + Same Amount
+    - PO_AMOUNT:
+        Same Vendor
+        + Same PO
+        + Same Currency
+        + Same Amount
+
+params:
+  company_code: ""
+  vendor: ""
+  vendor_query: ""
+  po: ""
+  start_date: "" # legacy name
+  end_date: "" # legacy name
+  start_posting_date: "" # preferred name
+  end_posting_date: "" # preferred name
+  batch_chunk_size: 30
+  include_results: ""
+  top: ""
+  suggest_top_n: 30
+
+steps:
+
+# -------------------------------------------------------------------
+# Step 1: Supplier invoice header (NO AccountingDocument here)
+# -------------------------------------------------------------------
+- op: fetch
+  name: inv_header_raw
+  source: sap
+  service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice
+  query_params:
+    $format: json
+    $select: >
+      SupplierInvoice,FiscalYear,PostingDate,InvoicingParty,DocumentCurrency,CompanyCode,SupplierInvoiceIDByInvcgParty
+    $orderby: "SupplierInvoice asc"
+  odata_filter: >
+    {% set v  = vendor|default('')|trim %} {% set vq = vendor_query|default('')|trim %} {% set cc = company_code|default('')|trim %} {% set sd = start_posting_date|default(start_date)|default('')|trim %} {% set ed = end_posting_date|default(end_date)|default('')|trim %} (
+      SupplierInvoice ne ''
+      {% if sd %} and PostingDate ge datetime'{{ sd }}T00:00:00' {% endif %}
+      {% if ed %} and PostingDate le datetime'{{ ed }}T23:59:59' {% endif %}
+      {% if cc %} and CompanyCode eq '{{ cc }}' {% endif %}
+      {% if v  %} and InvoicingParty eq '{{ v | upper }}' {% endif %}
+      {% if (not v) and vq %} and substringof('{{ vq | upper }}', InvoicingParty) {% endif %}
+    )
+
+# -------------------------------------------------------------------
+# Step 2: Supplier invoice items (PO-referenced)
+# -------------------------------------------------------------------
+- op: fetch
+  name: inv_item_raw
+  source: sap
+  service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SuplrInvcItemPurOrdRef
+  query_params:
+    $format: json
+    $select: >
+      SupplierInvoice,FiscalYear,SupplierInvoiceItem,PurchaseOrder,PurchaseOrderItem,DocumentCurrency,SupplierInvoiceItemAmount
+    $orderby: "PurchaseOrder asc"
+  odata_filter: >
+    {% set p = po|default('')|trim %} (
+      PurchaseOrder ne ''
+      {% if p %} and PurchaseOrder eq '{{ p }}' {% endif %}
+    )
+
+# -------------------------------------------------------------------
+# Step 3: Vendor master
+# -------------------------------------------------------------------
+- op: fetch
+  name: bp_master
+  source: sap
+  service: API_BUSINESS_PARTNER/A_BusinessPartner
+  query_params:
+    $format: json
+    $select: >
+      BusinessPartner,BusinessPartnerName
+  odata_filter: >
+    (BusinessPartner ne '')
+
+# -------------------------------------------------------------------
+# Step 4: GL Account Line Item – only mapping fields
+# -------------------------------------------------------------------
+- op: fetch
+  name: gl_lineitem_raw
+  source: sap
+  service: API_GLACCOUNTLINEITEM/GLAccountLineItem
+  query_params:
+    $format: json
+    $select: >
+      CompanyCode,FiscalYear,AccountingDocument,ReferenceDocument
+  odata_filter: >
+    (AccountingDocument ne '')
+
+# -------------------------------------------------------------------
+# Step 5: Reduce GL to unique mapping per (CompanyCode, FiscalYear, ReferenceDocument)
+# -------------------------------------------------------------------
+- op: sql
+  name: gl_doc_map
+  sql: |
+    SELECT
+      CompanyCode,
+      FiscalYear,
+      ReferenceDocument,
+      MIN(AccountingDocument) AS AccountingDocument
+    FROM gl_lineitem_raw
+    GROUP BY CompanyCode, FiscalYear, ReferenceDocument
+
+# -------------------------------------------------------------------
+# Step 6: Join invoice header + item
+# -------------------------------------------------------------------
+- op: join
+  name: inv_joined
+  left: inv_item_raw
+  right: inv_header_raw
+  left_on:
+  - SupplierInvoice
+  - FiscalYear
+  right_on:
+  - SupplierInvoice
+  - FiscalYear
+  type: inner
+
+# -------------------------------------------------------------------
+# Step 7: Join vendor names
+# -------------------------------------------------------------------
+- op: join
+  name: inv_with_vendor
+  left: inv_joined
+  right: bp_master
+  left_on: InvoicingParty
+  right_on: BusinessPartner
+  type: left
+
+# -------------------------------------------------------------------
+# Step 8: Join GL mapping (CompanyCode + FiscalYear + SupplierInvoice ⇔ ReferenceDocument)
+# -------------------------------------------------------------------
+- op: join
+  name: inv_with_accdoc
+  left: inv_with_vendor
+  right: gl_doc_map
+  left_on:
+  - CompanyCode
+  - FiscalYear
+  - SupplierInvoice
+  right_on:
+  - CompanyCode
+  - FiscalYear
+  - ReferenceDocument
+  type: left
+
+# -------------------------------------------------------------------
+# Step 9: Select canonical fields
+# -------------------------------------------------------------------
+- op: select
+  name: inv_flat
+  from: inv_with_accdoc
+  columns:
+  - "SupplierInvoice                           AS invoice"
+  - "FiscalYear                                AS fiscal_year"
+  - "SupplierInvoiceItem                       AS invoice_item"
+  - "PurchaseOrder                             AS po"
+  - "PurchaseOrderItem                         AS po_item"
+  - "InvoicingParty                            AS vendor_number"
+  - "COALESCE(BusinessPartnerName, InvoicingParty) AS vendor_name"
+  - "DocumentCurrency                          AS currency"
+  - "SupplierInvoiceItemAmount                 AS line_amount"
+  - "PostingDate                               AS posting_date"
+  - "AccountingDocument                        AS accounting_document"
+  - "SupplierInvoiceIDByInvcgParty             AS reference_document_number"
+  - "CompanyCode                               AS company_code"
+
+# -------------------------------------------------------------------
+# Step 10: Derive invoice_id and numeric amount
+# -------------------------------------------------------------------
+- op: derive
+  name: inv_enriched
+  from: inv_flat
+  add:
+  - name: amount_num
+    sql: "CAST(line_amount AS DOUBLE)"
+  - name: invoice_id
+    sql: "invoice || '/' || fiscal_year"
+
+# -------------------------------------------------------------------
+# Step 11: Filter valid data (keep only rows that can participate)
+# -------------------------------------------------------------------
+- op: filter
+  name: inv_filtered
+  from: inv_enriched
+  where: >
+    posting_date IS NOT NULL AND vendor_number IS NOT NULL AND po IS NOT NULL AND currency IS NOT NULL AND amount_num IS NOT NULL AND reference_document_number IS NOT NULL AND reference_document_number <> ''
+
+# -------------------------------------------------------------------
+# Step 12: Rule A (VENDOR_REF) groups:
+#          Vendor + Vendor Invoice Reference + Currency + Amount
+# -------------------------------------------------------------------
+- op: sql
+  name: dupe_vendor_ref
+  sql: |
+    SELECT
+      vendor_number,
+      vendor_name,
+      reference_document_number,
+      currency,
+      amount_num,
+      COUNT(*) AS line_count,
+      COUNT(DISTINCT invoice_id) AS distinct_invoices,
+      LISTAGG(DISTINCT invoice_id, ', ') AS invoices_list,
+      MIN(po) AS sample_po,
+      MIN(posting_date) AS first_posting_date,
+      MAX(posting_date) AS last_posting_date,
+      SUM(amount_num) AS total_amount
+    FROM inv_filtered
+    GROUP BY
+      vendor_number,
+      vendor_name,
+      reference_document_number,
+      currency,
+      amount_num
+    HAVING COUNT(DISTINCT invoice_id) > 1
+
+# -------------------------------------------------------------------
+# Step 13: Rule B (PO_AMOUNT) groups:
+#          Vendor + PO + Currency + Amount
+# -------------------------------------------------------------------
+- op: sql
+  name: dupe_po_amount
+  sql: |
+    SELECT
+      vendor_number,
+      vendor_name,
+      po,
+      currency,
+      amount_num,
+      COUNT(*) AS line_count,
+      COUNT(DISTINCT invoice_id) AS distinct_invoices,
+      LISTAGG(DISTINCT invoice_id, ', ') AS invoices_list,
+      MIN(posting_date) AS first_posting_date,
+      MAX(posting_date) AS last_posting_date,
+      SUM(amount_num) AS total_amount
+    FROM inv_filtered
+    GROUP BY
+      vendor_number,
+      vendor_name,
+      po,
+      currency,
+      amount_num
+    HAVING COUNT(DISTINCT invoice_id) > 1
+
+# -------------------------------------------------------------------
+# Step 14: Flag invoice lines with which rule(s) they hit
+#          duplicate_reason: VENDOR_REF / PO_AMOUNT / VENDOR_REF,PO_AMOUNT
+# -------------------------------------------------------------------
+- op: sql
+  name: inv_flagged
+  sql: |
+    SELECT
+      f.*,
+      CASE
+        WHEN a.vendor_number IS NOT NULL AND b.vendor_number IS NOT NULL THEN 'VENDOR_REF,PO_AMOUNT'
+        WHEN a.vendor_number IS NOT NULL THEN 'VENDOR_REF'
+        WHEN b.vendor_number IS NOT NULL THEN 'PO_AMOUNT'
+        ELSE NULL
+      END AS duplicate_reason
+    FROM inv_filtered f
+    LEFT JOIN dupe_vendor_ref a
+      ON  f.vendor_number             = a.vendor_number
+      AND f.reference_document_number = a.reference_document_number
+      AND f.currency                  = a.currency
+      AND f.amount_num                = a.amount_num
+    LEFT JOIN dupe_po_amount b
+      ON  f.vendor_number = b.vendor_number
+      AND f.po            = b.po
+      AND f.currency      = b.currency
+      AND f.amount_num    = b.amount_num
+    WHERE
+      a.vendor_number IS NOT NULL
+      OR b.vendor_number IS NOT NULL
+
+project:
+  wrap: true
+  result:
+    summary:
+      sql: |
+        SELECT
+          vendor_number              AS "Vendor Number",
+          vendor_name                AS "Vendor Name",
+          duplicate_reason           AS "Duplicate Reason",
+          COUNT(DISTINCT invoice_id) AS "Total Invoices Impacted",
+          COUNT(*)                   AS "Suspicious Lines",
+          SUM(amount_num)            AS "Total Value Flagged"
+        FROM inv_flagged
+        GROUP BY
+          vendor_number,
+          vendor_name,
+          duplicate_reason
+        ORDER BY
+          "Total Value Flagged" DESC
+
+    detailed_lines:
+      sql: |
+        SELECT
+          invoice                   AS "Invoice Number",
+          po                        AS "PO Number",
+          accounting_document       AS "Accounting Document",
+          reference_document_number AS "Vendor Invoice Reference",
+          posting_date              AS "Posting Date",
+          company_code              AS "Company Code",
+          vendor_number             AS "Vendor Number",
+          vendor_name               AS "Vendor Name",
+          currency                  AS "Currency",
+          amount_num                AS "Line Amount",
+          invoice_id                AS "Invoice ID (Invoice/FiscalYear)",
+          duplicate_reason          AS "Duplicate Reason"
+        FROM inv_flagged
+        ORDER BY
+          company_code,
+          posting_date,
+          invoice,
+          po,
+          invoice_item
