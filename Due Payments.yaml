@@ -1,0 +1,193 @@
+version: 1
+name: finance.predicted_payment_run_dynamic.v2.duckdb
+description: >
+  Predict payment run amounts within a selected payment due date window based on supplier invoices from API_SUPPLIERINVOICE_PROCESS_SRV (A_SupplierInvoice). Uses payment due date, excludes blocked invoices, and outputs:
+    - daily forecast by payment date & currency
+    - currency totals
+    - detailed invoice list with due status (PAST_DUE / DUE_TODAY / UPCOMING).
+  Supports filters for:
+    - as_of_date (reference date to classify PAST_DUE / DUE_TODAY / UPCOMING)
+    - due_from_date / due_to_date (payment due date range)
+    - due_status (which bucket to show).
+
+params:
+  company_code: "" # optional, reserved for future use
+  vendor: "" # optional, reserved for future use
+  vendor_query: "" # optional, reserved for future use
+  as_of_date: "" # optional override for current date (YYYY-MM-DD)
+  due_from_date: "" # optional payment due start date (YYYY-MM-DD)
+  due_to_date: "" # optional payment due end date (YYYY-MM-DD)
+  top: "" # optional LIMIT for top invoices
+  due_status: "" # '', ALL, PAST_DUE, DUE_TODAY, UPCOMING
+
+steps:
+
+# ---------------------------------------------------------
+# 1. Fetch Supplier Invoice Data
+# ---------------------------------------------------------
+- op: fetch
+  name: inv_raw
+  source: sap
+  service: API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoice
+  query_params:
+    $format: json
+    $select: >
+      SupplierInvoice,FiscalYear,CompanyCode,InvoicingParty, DocumentDate,PostingDate,DueCalculationBaseDate, NetPaymentDays,InvoiceGrossAmount,DocumentCurrency, PaymentBlockingReason,PaymentTerms
+
+# ---------------------------------------------------------
+# 2. Derive as_of_date, payment_due_date, invoice_amount, days_until_due
+# ---------------------------------------------------------
+- op: derive
+  name: inv_enriched
+  from: inv_raw
+  add:
+  # Effective reference date (as_of_date)
+  - name: as_of_date
+    sql: >
+      CASE
+        WHEN '{{ as_of_date|default("")|strip }}' <> ''
+        THEN CAST('{{ as_of_date|strip }}' AS DATE)
+        ELSE CURRENT_DATE
+      END
+
+  # Payment due date = DueCalculationBaseDate + NetPaymentDays
+  - name: payment_due_date
+    sql: >
+      CASE
+        WHEN DueCalculationBaseDate IS NOT NULL AND NetPaymentDays IS NOT NULL
+        THEN CAST(DueCalculationBaseDate AS DATE) + CAST(NetPaymentDays AS INTEGER)
+        ELSE NULL
+      END
+
+  # Numeric invoice amount
+  - name: invoice_amount
+    sql: "CAST(InvoiceGrossAmount AS DECIMAL(18,2))"
+
+  # Days until due (0 = today, negative = overdue)
+  - name: days_until_due
+    sql: >
+      CASE
+        WHEN DueCalculationBaseDate IS NOT NULL AND NetPaymentDays IS NOT NULL
+        THEN DATEDIFF(
+          'day',
+          CASE
+            WHEN '{{ as_of_date|default("")|strip }}' <> ''
+            THEN CAST('{{ as_of_date|strip }}' AS DATE)
+            ELSE CURRENT_DATE
+          END,
+          CAST(DueCalculationBaseDate AS DATE) + CAST(NetPaymentDays AS INTEGER)
+        )
+        ELSE NULL
+      END
+
+# ---------------------------------------------------------
+# 3. Classify due_status (PAST_DUE / DUE_TODAY / UPCOMING / OUT_OF_RANGE)
+# ---------------------------------------------------------
+- op: derive
+  name: inv_with_status
+  from: inv_enriched
+  add:
+  - name: due_status
+    sql: >
+      CASE
+        WHEN payment_due_date IS NULL THEN 'OUT_OF_RANGE'
+        WHEN payment_due_date < as_of_date THEN 'PAST_DUE'
+        WHEN payment_due_date = as_of_date THEN 'DUE_TODAY'
+        WHEN payment_due_date > as_of_date THEN 'UPCOMING'
+        ELSE 'OUT_OF_RANGE'
+      END
+
+# ---------------------------------------------------------
+# 4. Filter valid, unblocked invoices by due_status + date range
+# ---------------------------------------------------------
+- op: filter
+  name: inv_window
+  from: inv_with_status
+  where: >
+    payment_due_date IS NOT NULL AND invoice_amount IS NOT NULL AND (PaymentBlockingReason IS NULL OR PaymentBlockingReason = '') AND due_status IN ('PAST_DUE','DUE_TODAY','UPCOMING') {% if due_status|default('')|upper|strip and due_status|default('')|upper|strip != 'ALL' %} AND due_status = '{{ due_status|upper|strip }}' {% endif %} {% if due_from_date|default('')|strip %} AND payment_due_date >= CAST('{{ due_from_date|strip }}' AS DATE) {% endif %} {% if due_to_date|default('')|strip %} AND payment_due_date <= CAST('{{ due_to_date|strip }}' AS DATE) {% endif %}
+
+# ---------------------------------------------------------
+# 5. Daily forecast (per date, per currency)
+# ---------------------------------------------------------
+- op: groupby
+  name: daily_forecast
+  from: inv_window
+  by:
+  - payment_due_date
+  - DocumentCurrency
+  aggs:
+  - func: COUNT
+    col: "*"
+    as: invoice_count
+  - func: SUM
+    col: invoice_amount
+    as: total_amount
+
+# ---------------------------------------------------------
+# 6. Currency totals (overall)
+# ---------------------------------------------------------
+- op: groupby
+  name: summary_by_currency
+  from: inv_window
+  by:
+  - DocumentCurrency
+  aggs:
+  - func: COUNT
+    col: "*"
+    as: total_invoices
+  - func: SUM
+    col: invoice_amount
+    as: total_amount
+
+# ---------------------------------------------------------
+# 7. Detailed invoice list (with due_status)
+# ---------------------------------------------------------
+- op: sql
+  name: top_invoices
+  sql: |
+    SELECT
+      payment_due_date,
+      SupplierInvoice,
+      FiscalYear,
+      CompanyCode,
+      InvoicingParty,
+      invoice_amount AS Amount,
+      DocumentCurrency,
+      days_until_due,
+      due_status,
+      DocumentDate,
+      PostingDate,
+      DueCalculationBaseDate,
+      NetPaymentDays,
+      PaymentTerms,
+      PaymentBlockingReason
+    FROM inv_window
+    ORDER BY
+      payment_due_date,
+      invoice_amount DESC,
+      SupplierInvoice
+    {% if top|default('')|strip %}
+    LIMIT {{ top }}
+    {% endif %}
+
+# ---------------------------------------------------------
+# 8. Expose result tables
+# ---------------------------------------------------------
+project:
+  tables:
+    daily_forecast:
+      from: daily_forecast
+      order_by:
+      - payment_due_date
+      - DocumentCurrency
+
+    summary_by_currency:
+      from: summary_by_currency
+      order_by:
+      - DocumentCurrency
+
+    top_invoices:
+      from: top_invoices
+      order_by:
+      - payment_due_date
+      - SupplierInvoice
