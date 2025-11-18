@@ -1,7 +1,7 @@
 version: 1
 name: finance.grir_ir_over_po_10pct.v1.duckdb
 description: >
-  Find GRIR entries (Posted GR & Posted IR) where the Invoice Value (from SupplierInvoiceItemAmount) exceeds the PO Value by more than 10%. Includes Vendor Name and Company Name.
+  Find GRIR entries (Posted GR & Posted IR) where the Invoice Value (from SupplierInvoiceItemAmount) exceeds the PO Value by more than a configurable percentage (over_pct). Includes Vendor Name and Company Name.
 
 params:
   vendor: "" # optional vendor ID (e.g., 1000000250)
@@ -11,6 +11,7 @@ params:
   company_code: "" # optional company code filter (e.g. BC01)
   start_posting_date: "" # optional (YYYY-MM-DD) – applied to GR/IR posting dates
   end_posting_date: "" # optional (YYYY-MM-DD)
+  over_pct: "10" # optional min % that IR exceeds PO (e.g. 10 = >10%, 20 = >20%)
   top: "" # optional LIMIT
 
 steps:
@@ -217,7 +218,7 @@ steps:
     GROUP BY 1,2
 
 # ---------------------------------------------------------
-# 6) Result — only IR > 110% of PO
+# 6) Result — only IR > (1 + over_pct%) of PO
 # ---------------------------------------------------------
 - op: sql
   name: result
@@ -259,7 +260,7 @@ steps:
      AND p.PurchaseOrderItem = i.PurchaseOrderItem
     WHERE g.gr_status = 'Posted'
       AND i.invoice_status = 'Posted'
-      AND i.ir_value > (p.po_value * 1.10)
+      AND i.ir_value > (p.po_value * (1 + ({{ over_pct|int }} / 100.0)))
     ORDER BY
       (i.ir_value - p.po_value) DESC,
       p.PurchaseOrder, p.PurchaseOrderItem
